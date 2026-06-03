@@ -510,8 +510,19 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
-# OAuth / OpenID discovery endpoints (required by MCPGateway & mcp-remote)
+# Discovery endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/.well-known/mcp.json")
+async def mcp_discovery():
+    return JSONResponse(content={
+        "mcpVersion": "1.0.0",
+        "authentication": {"method": "None"},
+        "tools": [{"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]} for t in TOOLS],
+    })
+
+
+# OAuth / OpenID well-known endpoints (required by MCPGateway & mcp-remote)
 
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/mcp")
