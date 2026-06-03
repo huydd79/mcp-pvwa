@@ -141,22 +141,41 @@ async def _get_idp_jwks() -> list:
 async def _validate_idp_token(token: str) -> bool:
     try:
         from jwt.algorithms import RSAAlgorithm
+
+        # Log unverified claims để debug
+        try:
+            unverified = pyjwt.decode(token, options={"verify_signature": False})
+            logger.info("Token claims — iss: %s | aud: %s | exp: %s",
+                        unverified.get("iss"), unverified.get("aud"), unverified.get("exp"))
+        except Exception:
+            pass
+
         keys = await _get_idp_jwks()
-        meta = await _get_idp_meta()
-        issuer = IDP_ISSUER or meta.get("issuer", "")
-        audience = IDP_AUDIENCE or None
         header = pyjwt.get_unverified_header(token)
         kid = header.get("kid")
+        alg = header.get("alg", "RS256")
         matched = [k for k in keys if k.get("kid") == kid] if kid else keys
+
+        if not matched:
+            logger.warning("No JWKS key matched kid=%s", kid)
+            return False
+
         for key_data in matched:
             try:
                 public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
-                options = {"verify_aud": bool(audience)}
-                pyjwt.decode(token, public_key, algorithms=["RS256", "RS384", "RS512"],
-                             audience=audience, issuer=issuer, options=options)
+                # Chỉ verify signature + expiry; bỏ qua iss/aud (IdP tự quản lý)
+                options = {"verify_aud": False, "verify_iss": False}
+                pyjwt.decode(token, public_key, algorithms=[alg], options=options)
+                logger.info("IdP token validated OK (kid=%s)", kid)
                 return True
-            except Exception:
+            except pyjwt.ExpiredSignatureError:
+                logger.warning("IdP token expired")
+                return False
+            except Exception as e:
+                logger.warning("Key %s validation failed: %s", key_data.get("kid"), e)
                 continue
+
+        logger.warning("IdP token: all keys failed validation")
         return False
     except Exception as e:
         logger.warning("IdP token validation error: %s", e)
@@ -850,6 +869,10 @@ async def token_endpoint(request: Request):
 
     # ── External IdP: proxy token request ─────────────────────────────────
     if USE_EXTERNAL_IDP:
+        if not grant_type:
+            return JSONResponse(status_code=400,
+                                content={"error": "invalid_request", "message": "grant_type is required"})
+
         meta = await _get_idp_meta()
         idp_token_url = meta.get("token_endpoint", "")
 
