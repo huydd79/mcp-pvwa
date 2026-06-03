@@ -16,9 +16,11 @@ import logging
 from typing import Any, Optional
 
 import httpx
+import asyncio
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -505,6 +507,23 @@ app.add_middleware(
 @app.get("/")
 async def health_check():
     return {"status": "online", "message": "CyberArk PVWA MCP Server is running"}
+
+
+@app.get("/mcp")
+async def mcp_sse_channel(request: Request):
+    """SSE channel for server-to-client messages (required by mcp-remote / streamable-http spec)."""
+    async def event_stream():
+        while True:
+            if await request.is_disconnected():
+                break
+            yield ": heartbeat\n\n"
+            await asyncio.sleep(15)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/mcp")
