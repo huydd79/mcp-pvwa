@@ -527,12 +527,7 @@ async def mcp_discovery():
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/mcp")
 async def oauth_protected_resource():
-    return JSONResponse(content={
-        "resource": "https://testmcp.home.huydo.net",
-        "authorization_servers": [],
-        "bearer_methods_supported": ["header"],
-        "scopes_supported": [],
-    })
+    return JSONResponse(content={"protected": False})
 
 
 @app.get("/.well-known/oauth-authorization-server")
