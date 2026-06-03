@@ -20,7 +20,7 @@ import asyncio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -532,7 +532,7 @@ async def mcp_endpoint(payload: dict):
     req_id = payload.get("id", 1)
 
     if method == "initialize":
-        return {
+        return JSONResponse(content={
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
@@ -544,19 +544,19 @@ async def mcp_endpoint(payload: dict):
                 },
                 "serverInfo": {"name": "cyberark-pvwa", "version": "2.0.0"},
             },
-        }
+        })
 
     if method in ("tools/list", "list_tools"):
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
 
     if method == "resources/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}})
 
     if method == "resources/templates/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}}
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}})
 
     if method == "prompts/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}}
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}})
 
     if method == "tools/call":
         params = payload.get("params", {})
@@ -565,25 +565,24 @@ async def mcp_endpoint(payload: dict):
 
         handler = TOOL_HANDLERS.get(tool_name)
         if not handler:
-            return {
+            return JSONResponse(content={
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"},
-            }
+            })
 
         try:
             result = await handler(tool_args)
-            return {"jsonrpc": "2.0", "id": req_id, "result": result}
+            return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": result})
         except Exception as e:
             logger.exception("Tool %s failed", tool_name)
-            return {
+            return JSONResponse(content={
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True},
-            }
+            })
 
-    # Notifications and unknown methods — no response needed
-    return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+    return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 
 # ---------------------------------------------------------------------------
