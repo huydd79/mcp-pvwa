@@ -617,14 +617,16 @@ async def oauth_authorization_server():
     if OAUTH_ENABLED:
         return JSONResponse(content={
             "issuer": OAUTH_ISSUER,
+            "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
             "grant_types_supported": ["client_credentials"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
             "scopes_supported": ["mcp:read", "mcp:write"],
             "response_types_supported": ["token"],
+            "code_challenge_methods_supported": ["S256"],
         })
-    return JSONResponse(content={"issuer": "none"})
+    return JSONResponse(content={"issuer": "none", "authorization_endpoint": "none"})
 
 
 @app.get("/.well-known/jwks.json")
