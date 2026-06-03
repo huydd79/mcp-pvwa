@@ -3,21 +3,36 @@ CyberArk PVWA MCP Server
 
 Manages privileged accounts via CyberArk Self-Hosted PAM REST API.
 Configuration via environment variables:
-  CYBERARK_PVWA_URL     - Base URL, e.g. https://my.pvwa.com
-  CYBERARK_AUTH_TYPE    - CyberArk | Windows | LDAP | RADIUS
-  CYBERARK_USERNAME     - PVWA username
-  CYBERARK_PASSWORD     - PVWA password
-  CYBERARK_VERIFY_SSL   - true (default) | false (for lab environments)
+  CYBERARK_PVWA_URL       - Base URL, e.g. https://my.pvwa.com
+  CYBERARK_AUTH_TYPE      - CyberArk | Windows | LDAP | RADIUS
+  CYBERARK_USERNAME       - PVWA username
+  CYBERARK_PASSWORD       - PVWA password
+  CYBERARK_VERIFY_SSL     - true (default) | false (for lab environments)
+
+  OAUTH_ENABLED           - true | false (default false)
+  OAUTH_ISSUER            - Public base URL, e.g. https://testmcp.home.huydo.net
+  OAUTH_CLIENT_ID         - OAuth client ID
+  OAUTH_CLIENT_SECRET     - OAuth client secret
+  OAUTH_TOKEN_EXPIRY      - Token TTL in seconds (default 3600)
+  OAUTH_PRIVATE_KEY_PEM   - RSA private key in PEM format (auto-generated if absent)
 """
 
 import os
 import json
+import base64
+import uuid
+import time
 import logging
 from typing import Any, Optional
 
 import httpx
 import asyncio
 import uvicorn
+import jwt as pyjwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.backends import default_backend
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -36,6 +51,57 @@ PASSWORD = os.environ.get("CYBERARK_PASSWORD", "")
 VERIFY_SSL = os.environ.get("CYBERARK_VERIFY_SSL", "true").lower() != "false"
 
 BASE_API = f"{PVWA_URL}/PasswordVault/API"
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 Configuration
+# ---------------------------------------------------------------------------
+
+OAUTH_ENABLED = os.environ.get("OAUTH_ENABLED", "false").lower() == "true"
+OAUTH_ISSUER = os.environ.get("OAUTH_ISSUER", "http://localhost:8000").rstrip("/")
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "mcp-client")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+OAUTH_TOKEN_EXPIRY = int(os.environ.get("OAUTH_TOKEN_EXPIRY", "3600"))
+
+_KID = str(uuid.uuid4())[:8]
+
+_pem_env = os.environ.get("OAUTH_PRIVATE_KEY_PEM", "")
+if _pem_env:
+    _private_key = load_pem_private_key(_pem_env.encode(), password=None, backend=default_backend())
+else:
+    _private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+
+_public_key = _private_key.public_key()
+_private_pem = _private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+_public_pem = _public_key.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def _b64url(n: int) -> str:
+    blen = (n.bit_length() + 7) // 8
+    return base64.urlsafe_b64encode(n.to_bytes(blen, "big")).rstrip(b"=").decode()
+
+
+def _jwks() -> dict:
+    nums = _public_key.public_numbers()
+    return {"keys": [{"kty": "RSA", "use": "sig", "kid": _KID, "alg": "RS256", "n": _b64url(nums.n), "e": _b64url(nums.e)}]}
+
+
+def _issue_token(client_id: str, scope: str = "mcp:read mcp:write") -> str:
+    now = int(time.time())
+    payload = {"iss": OAUTH_ISSUER, "sub": client_id, "aud": OAUTH_ISSUER,
+               "iat": now, "exp": now + OAUTH_TOKEN_EXPIRY, "jti": str(uuid.uuid4()), "scope": scope}
+    return pyjwt.encode(payload, _private_pem, algorithm="RS256", headers={"kid": _KID})
+
+
+def _validate_token(authorization: str) -> bool:
+    if not OAUTH_ENABLED:
+        return True
+    if not authorization or not authorization.startswith("Bearer "):
+        return False
+    try:
+        pyjwt.decode(authorization[7:], _public_pem, algorithms=["RS256"], audience=OAUTH_ISSUER)
+        return True
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # PVWA HTTP client with automatic session management
@@ -515,9 +581,18 @@ async def health_check():
 
 @app.get("/.well-known/mcp.json")
 async def mcp_discovery():
+    if OAUTH_ENABLED:
+        auth_meta = {
+            "method": "OAuth2.1",
+            "authorizationServer": OAUTH_ISSUER,
+            "tokenEndpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "scopes": ["mcp:read", "mcp:write"],
+        }
+    else:
+        auth_meta = {"method": "None"}
     return JSONResponse(content={
         "mcpVersion": "1.0.0",
-        "authentication": {"method": "None"},
+        "authentication": auth_meta,
         "tools": [{"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]} for t in TOOLS],
     })
 
@@ -527,22 +602,83 @@ async def mcp_discovery():
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/mcp")
 async def oauth_protected_resource():
+    if OAUTH_ENABLED:
+        return JSONResponse(content={
+            "resource": OAUTH_ISSUER,
+            "authorization_servers": [OAUTH_ISSUER],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["mcp:read", "mcp:write"],
+        })
     return JSONResponse(content={"protected": False})
 
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_authorization_server():
+    if OAUTH_ENABLED:
+        return JSONResponse(content={
+            "issuer": OAUTH_ISSUER,
+            "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
+            "grant_types_supported": ["client_credentials"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+            "scopes_supported": ["mcp:read", "mcp:write"],
+            "response_types_supported": ["token"],
+        })
     return JSONResponse(content={"issuer": "none"})
+
+
+@app.get("/.well-known/jwks.json")
+async def jwks_endpoint():
+    return JSONResponse(content=_jwks())
 
 
 @app.get("/.well-known/openid-configuration")
 async def openid_configuration():
+    if OAUTH_ENABLED:
+        return JSONResponse(content={
+            "issuer": OAUTH_ISSUER,
+            "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
+            "grant_types_supported": ["client_credentials"],
+            "response_types_supported": ["token"],
+        })
     return JSONResponse(content={
         "issuer": "none",
         "authorization_endpoint": "none",
         "token_endpoint": "none",
         "jwks_uri": "none",
         "response_types_supported": [],
+    })
+
+
+@app.post("/oauth/token")
+async def token_endpoint(request: Request):
+    body = await request.form()
+    grant_type = body.get("grant_type", "")
+
+    if grant_type != "client_credentials":
+        return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
+
+    # Support Basic auth or form params
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+        decoded = base64.b64decode(auth_header[6:] + "==").decode(errors="replace")
+        client_id, _, client_secret = decoded.partition(":")
+    else:
+        client_id = body.get("client_id", "")
+        client_secret = body.get("client_secret", "")
+
+    if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
+        return JSONResponse(status_code=401, content={"error": "invalid_client"})
+
+    scope = body.get("scope", "mcp:read mcp:write")
+    token = _issue_token(client_id, scope)
+    logger.info("Token issued for client: %s", client_id)
+    return JSONResponse(content={
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": OAUTH_TOKEN_EXPIRY,
+        "scope": scope,
     })
 
 
@@ -564,7 +700,14 @@ async def mcp_sse_channel(request: Request):
 
 
 @app.post("/mcp")
-async def mcp_endpoint(payload: dict):
+async def mcp_endpoint(payload: dict, request: Request):
+    if not _validate_token(request.headers.get("Authorization", "")):
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": f'Bearer realm="{OAUTH_ISSUER}"'},
+            content={"error": "Unauthorized", "message": "Valid Bearer token required"},
+        )
+
     method = payload.get("method")
     req_id = payload.get("id", 1)
 
