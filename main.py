@@ -25,6 +25,7 @@ import secrets
 import uuid
 import time
 import logging
+import urllib.parse
 from typing import Any, Optional
 
 import httpx
@@ -64,6 +65,20 @@ OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "mcp-client")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 OAUTH_TOKEN_EXPIRY = int(os.environ.get("OAUTH_TOKEN_EXPIRY", "3600"))
 
+# External IdP (Okta / CyberArk Identity)
+IDP_ISSUER = os.environ.get("IDP_ISSUER", "").rstrip("/")
+IDP_DISCOVERY_URL = os.environ.get("IDP_DISCOVERY_URL", "")
+IDP_CLIENT_ID = os.environ.get("IDP_CLIENT_ID", "")
+IDP_CLIENT_SECRET = os.environ.get("IDP_CLIENT_SECRET", "")
+IDP_AUDIENCE = os.environ.get("IDP_AUDIENCE", "")
+IDP_SCOPE = os.environ.get("IDP_SCOPE", "openid profile")
+USE_EXTERNAL_IDP = bool(IDP_ISSUER or IDP_DISCOVERY_URL)
+
+# IdP metadata + JWKS cache
+_idp_meta: dict = {}
+_idp_jwks_cache: dict = {"keys": [], "at": 0}
+_JWKS_TTL = 3600
+
 _KID = str(uuid.uuid4())[:8]
 
 _pem_env = os.environ.get("OAUTH_PRIVATE_KEY_PEM", "")
@@ -92,6 +107,72 @@ def _issue_token(client_id: str, scope: str = "mcp:read mcp:write") -> str:
     payload = {"iss": OAUTH_ISSUER, "sub": client_id, "aud": OAUTH_ISSUER,
                "iat": now, "exp": now + OAUTH_TOKEN_EXPIRY, "jti": str(uuid.uuid4()), "scope": scope}
     return pyjwt.encode(payload, _private_pem, algorithm="RS256", headers={"kid": _KID})
+
+
+async def _get_idp_meta() -> dict:
+    global _idp_meta
+    if _idp_meta:
+        return _idp_meta
+    discovery = IDP_DISCOVERY_URL or f"{IDP_ISSUER}/.well-known/openid-configuration"
+    async with httpx.AsyncClient() as c:
+        r = await c.get(discovery, follow_redirects=True)
+        r.raise_for_status()
+        _idp_meta = r.json()
+    logger.info("IdP metadata loaded from %s", discovery)
+    return _idp_meta
+
+
+async def _get_idp_jwks() -> list:
+    global _idp_jwks_cache
+    now = time.time()
+    if _idp_jwks_cache["keys"] and now - _idp_jwks_cache["at"] < _JWKS_TTL:
+        return _idp_jwks_cache["keys"]
+    meta = await _get_idp_meta()
+    jwks_uri = meta.get("jwks_uri", "")
+    async with httpx.AsyncClient() as c:
+        r = await c.get(jwks_uri)
+        r.raise_for_status()
+        data = r.json()
+    _idp_jwks_cache = {"keys": data.get("keys", []), "at": now}
+    logger.info("IdP JWKS refreshed (%d keys)", len(_idp_jwks_cache["keys"]))
+    return _idp_jwks_cache["keys"]
+
+
+async def _validate_idp_token(token: str) -> bool:
+    try:
+        from jwt.algorithms import RSAAlgorithm
+        keys = await _get_idp_jwks()
+        meta = await _get_idp_meta()
+        issuer = IDP_ISSUER or meta.get("issuer", "")
+        audience = IDP_AUDIENCE or None
+        header = pyjwt.get_unverified_header(token)
+        kid = header.get("kid")
+        matched = [k for k in keys if k.get("kid") == kid] if kid else keys
+        for key_data in matched:
+            try:
+                public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
+                options = {"verify_aud": bool(audience)}
+                pyjwt.decode(token, public_key, algorithms=["RS256", "RS384", "RS512"],
+                             audience=audience, issuer=issuer, options=options)
+                return True
+            except Exception:
+                continue
+        return False
+    except Exception as e:
+        logger.warning("IdP token validation error: %s", e)
+        return False
+
+
+async def _auth_ok(authorization: str) -> bool:
+    """Unified auth check — internal or external IdP."""
+    if not OAUTH_ENABLED:
+        return True
+    if not authorization or not authorization.startswith("Bearer "):
+        return False
+    token = authorization[7:]
+    if USE_EXTERNAL_IDP:
+        return await _validate_idp_token(token)
+    return _validate_token(authorization)
 
 
 # In-memory stores (reset on restart)
@@ -621,6 +702,20 @@ async def oauth_protected_resource():
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_authorization_server():
+    if USE_EXTERNAL_IDP:
+        meta = await _get_idp_meta()
+        return JSONResponse(content={
+            "issuer": meta.get("issuer", IDP_ISSUER),
+            "authorization_endpoint": meta.get("authorization_endpoint", ""),
+            "token_endpoint": meta.get("token_endpoint", ""),
+            "jwks_uri": meta.get("jwks_uri", ""),
+            "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
+            "grant_types_supported": meta.get("grant_types_supported", ["authorization_code"]),
+            "response_types_supported": meta.get("response_types_supported", ["code"]),
+            "token_endpoint_auth_methods_supported": meta.get("token_endpoint_auth_methods_supported", ["client_secret_basic"]),
+            "code_challenge_methods_supported": meta.get("code_challenge_methods_supported", ["S256"]),
+            "scopes_supported": meta.get("scopes_supported", ["openid", "profile"]),
+        })
     if OAUTH_ENABLED:
         return JSONResponse(content={
             "issuer": OAUTH_ISSUER,
@@ -644,6 +739,9 @@ async def jwks_endpoint():
 
 @app.get("/.well-known/openid-configuration")
 async def openid_configuration():
+    if USE_EXTERNAL_IDP:
+        meta = await _get_idp_meta()
+        return JSONResponse(content=meta)
     if OAUTH_ENABLED:
         return JSONResponse(content={
             "issuer": OAUTH_ISSUER,
@@ -697,21 +795,25 @@ async def register_client(request: Request):
 
 
 @app.get("/oauth/authorize")
-async def authorize(
-    request: Request,
-    response_type: str = "code",
-    client_id: str = "",
-    redirect_uri: str = "",
-    state: str = "",
-    scope: str = "mcp:read mcp:write",
-    code_challenge: str = "",
-    code_challenge_method: str = "S256",
-):
-    """Authorization endpoint — issues code immediately (no login UI for M2M)."""
+async def authorize(request: Request):
+    """Authorization endpoint — proxy to IdP or issue code internally."""
+    params = dict(request.query_params)
+    client_id = params.get("client_id", "")
+    redirect_uri = params.get("redirect_uri", "")
+
     if not client_id or not redirect_uri:
         return JSONResponse(status_code=400, content={"error": "invalid_request"})
 
-    # Validate client exists (registered or static)
+    if USE_EXTERNAL_IDP:
+        # Proxy: redirect to IdP authorization endpoint
+        meta = await _get_idp_meta()
+        idp_auth_url = meta.get("authorization_endpoint", "")
+        # Use IdP client_id, keep other params from original request
+        fwd = {**params, "client_id": IDP_CLIENT_ID or client_id}
+        qs = urllib.parse.urlencode(fwd)
+        return RedirectResponse(url=f"{idp_auth_url}?{qs}", status_code=302)
+
+    # Internal: auto-grant authorization code
     is_static = (client_id == OAUTH_CLIENT_ID)
     is_registered = client_id in _registered_clients
     if not is_static and not is_registered:
@@ -719,19 +821,17 @@ async def authorize(
 
     code = secrets.token_urlsafe(32)
     _auth_codes[code] = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "scope": scope,
+        "client_id": client_id, "redirect_uri": redirect_uri,
+        "code_challenge": params.get("code_challenge", ""),
+        "code_challenge_method": params.get("code_challenge_method", "S256"),
+        "scope": params.get("scope", "mcp:read mcp:write"),
         "exp": int(time.time()) + 300,
     }
     logger.info("Auth code issued for client: %s", client_id)
-
     sep = "&" if "?" in redirect_uri else "?"
     url = f"{redirect_uri}{sep}code={code}"
-    if state:
-        url += f"&state={state}"
+    if params.get("state"):
+        url += f"&state={params['state']}"
     return RedirectResponse(url=url, status_code=302)
 
 
@@ -739,6 +839,22 @@ async def authorize(
 async def token_endpoint(request: Request):
     body = await request.form()
     grant_type = body.get("grant_type", "")
+
+    # ── External IdP: proxy token request ─────────────────────────────────
+    if USE_EXTERNAL_IDP:
+        meta = await _get_idp_meta()
+        idp_token_url = meta.get("token_endpoint", "")
+        form_data = dict(body)
+        # Add confidential client credentials
+        if IDP_CLIENT_ID:
+            form_data["client_id"] = IDP_CLIENT_ID
+        if IDP_CLIENT_SECRET:
+            form_data["client_secret"] = IDP_CLIENT_SECRET
+        async with httpx.AsyncClient() as c:
+            r = await c.post(idp_token_url, data=form_data,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        return JSONResponse(status_code=r.status_code, content=r.json())
+
 
     # Extract client credentials (Basic auth or form params)
     auth_header = request.headers.get("Authorization", "")
@@ -824,10 +940,10 @@ async def mcp_sse_channel(request: Request):
 
 @app.post("/mcp")
 async def mcp_endpoint(payload: dict, request: Request):
-    if not _validate_token(request.headers.get("Authorization", "")):
+    if not await _auth_ok(request.headers.get("Authorization", "")):
         return JSONResponse(
             status_code=401,
-            headers={"WWW-Authenticate": f'Bearer realm="{OAUTH_ISSUER}"'},
+            headers={"WWW-Authenticate": f'Bearer realm="{IDP_ISSUER or OAUTH_ISSUER}"'},
             content={"error": "Unauthorized", "message": "Valid Bearer token required"},
         )
 
