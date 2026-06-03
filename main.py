@@ -706,15 +706,16 @@ async def oauth_authorization_server():
         meta = await _get_idp_meta()
         return JSONResponse(content={
             "issuer": meta.get("issuer", IDP_ISSUER),
-            "authorization_endpoint": meta.get("authorization_endpoint", ""),
-            "token_endpoint": meta.get("token_endpoint", ""),
+            # Trỏ về proxy của chúng ta — để scope override hoạt động
+            "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
+            "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "jwks_uri": meta.get("jwks_uri", ""),
             "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
-            "grant_types_supported": meta.get("grant_types_supported", ["authorization_code"]),
-            "response_types_supported": meta.get("response_types_supported", ["code"]),
-            "token_endpoint_auth_methods_supported": meta.get("token_endpoint_auth_methods_supported", ["client_secret_basic"]),
-            "code_challenge_methods_supported": meta.get("code_challenge_methods_supported", ["S256"]),
-            "scopes_supported": meta.get("scopes_supported", ["openid", "profile"]),
+            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "response_types_supported": ["code"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": IDP_SCOPE.split(),
         })
     if OAUTH_ENABLED:
         return JSONResponse(content={
@@ -741,7 +742,12 @@ async def jwks_endpoint():
 async def openid_configuration():
     if USE_EXTERNAL_IDP:
         meta = await _get_idp_meta()
-        return JSONResponse(content=meta)
+        return JSONResponse(content={
+            **meta,
+            "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
+            "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
+        })
     if OAUTH_ENABLED:
         return JSONResponse(content={
             "issuer": OAUTH_ISSUER,
@@ -805,11 +811,13 @@ async def authorize(request: Request):
         return JSONResponse(status_code=400, content={"error": "invalid_request"})
 
     if USE_EXTERNAL_IDP:
-        # Proxy: redirect to IdP authorization endpoint
         meta = await _get_idp_meta()
         idp_auth_url = meta.get("authorization_endpoint", "")
-        # Use IdP client_id, keep other params from original request
-        fwd = {**params, "client_id": IDP_CLIENT_ID or client_id}
+        fwd = {
+            **params,
+            "client_id": IDP_CLIENT_ID or client_id,
+            "scope": IDP_SCOPE,  # override với scope IdP hỗ trợ
+        }
         qs = urllib.parse.urlencode(fwd)
         return RedirectResponse(url=f"{idp_auth_url}?{qs}", status_code=302)
 
@@ -845,11 +853,12 @@ async def token_endpoint(request: Request):
         meta = await _get_idp_meta()
         idp_token_url = meta.get("token_endpoint", "")
         form_data = dict(body)
-        # Add confidential client credentials
         if IDP_CLIENT_ID:
             form_data["client_id"] = IDP_CLIENT_ID
         if IDP_CLIENT_SECRET:
             form_data["client_secret"] = IDP_CLIENT_SECRET
+        # Override scope với giá trị IdP hỗ trợ
+        form_data["scope"] = IDP_SCOPE
         async with httpx.AsyncClient() as c:
             r = await c.post(idp_token_url, data=form_data,
                              headers={"Content-Type": "application/x-www-form-urlencoded"})
