@@ -1,0 +1,22 @@
+services:
+
+  # ── Main MCP server (streamable-http transport) ────────────────────────────
+  # Usage: docker compose up mcp-server
+  #        MCP endpoint: http://localhost:8000/mcp
+  mcp-server:
+    build: .
+    image: cyberark-pvwa-mcp:v1
+    env_file: .env
+    environment:
+      - MCP_TRANSPORT=streamable-http
+    ports:
+      - "8000:8000"
+
+  # ── Connectivity / smoke test ───────────────────────────────────────────────
+  # Usage: docker compose run --rm test
+  test:
+    build: .
+    image: cyberark-pvwa-mcp:v1
+    env_file: .env
+    command: python3 test_connection.py
+    profiles: [test]
