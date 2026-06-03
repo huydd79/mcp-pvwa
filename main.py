@@ -20,6 +20,8 @@ Configuration via environment variables:
 import os
 import json
 import base64
+import hashlib
+import secrets
 import uuid
 import time
 import logging
@@ -35,7 +37,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.backends import default_backend
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,6 +92,11 @@ def _issue_token(client_id: str, scope: str = "mcp:read mcp:write") -> str:
     payload = {"iss": OAUTH_ISSUER, "sub": client_id, "aud": OAUTH_ISSUER,
                "iat": now, "exp": now + OAUTH_TOKEN_EXPIRY, "jti": str(uuid.uuid4()), "scope": scope}
     return pyjwt.encode(payload, _private_pem, algorithm="RS256", headers={"kid": _KID})
+
+
+# In-memory stores (reset on restart)
+_registered_clients: dict = {}  # client_id → {client_secret, redirect_uris, ...}
+_auth_codes: dict = {}           # code → {client_id, redirect_uri, code_challenge, scope, exp}
 
 
 def _validate_token(authorization: str) -> bool:
@@ -619,12 +626,13 @@ async def oauth_authorization_server():
             "issuer": OAUTH_ISSUER,
             "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
             "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
-            "grant_types_supported": ["client_credentials"],
-            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
-            "scopes_supported": ["mcp:read", "mcp:write"],
-            "response_types_supported": ["token"],
+            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "response_types_supported": ["code"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["mcp:read", "mcp:write"],
         })
     return JSONResponse(content={"issuer": "none", "authorization_endpoint": "none"})
 
@@ -641,9 +649,13 @@ async def openid_configuration():
             "issuer": OAUTH_ISSUER,
             "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
+            "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
             "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
-            "grant_types_supported": ["client_credentials"],
-            "response_types_supported": ["token"],
+            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "response_types_supported": ["code"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["mcp:read", "mcp:write"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
         })
@@ -656,15 +668,79 @@ async def openid_configuration():
     })
 
 
+@app.post("/oauth/register")
+async def register_client(request: Request):
+    """Dynamic Client Registration — RFC 7591."""
+    body = await request.json()
+    client_id = str(uuid.uuid4())
+    client_secret = secrets.token_urlsafe(32)
+    _registered_clients[client_id] = {
+        "client_secret": client_secret,
+        "redirect_uris": body.get("redirect_uris", []),
+        "client_name": body.get("client_name", ""),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_basic"),
+        "scope": body.get("scope", "mcp:read mcp:write"),
+    }
+    logger.info("Client registered: %s (%s)", client_id, body.get("client_name", ""))
+    return JSONResponse(status_code=201, content={
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": int(time.time()),
+        "client_secret_expires_at": 0,
+        "redirect_uris": _registered_clients[client_id]["redirect_uris"],
+        "grant_types": _registered_clients[client_id]["grant_types"],
+        "token_endpoint_auth_method": _registered_clients[client_id]["token_endpoint_auth_method"],
+        "registration_client_uri": f"{OAUTH_ISSUER}/oauth/register/{client_id}",
+        "registration_access_token": secrets.token_urlsafe(16),
+    })
+
+
+@app.get("/oauth/authorize")
+async def authorize(
+    request: Request,
+    response_type: str = "code",
+    client_id: str = "",
+    redirect_uri: str = "",
+    state: str = "",
+    scope: str = "mcp:read mcp:write",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
+):
+    """Authorization endpoint — issues code immediately (no login UI for M2M)."""
+    if not client_id or not redirect_uri:
+        return JSONResponse(status_code=400, content={"error": "invalid_request"})
+
+    # Validate client exists (registered or static)
+    is_static = (client_id == OAUTH_CLIENT_ID)
+    is_registered = client_id in _registered_clients
+    if not is_static and not is_registered:
+        return JSONResponse(status_code=400, content={"error": "invalid_client"})
+
+    code = secrets.token_urlsafe(32)
+    _auth_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope,
+        "exp": int(time.time()) + 300,
+    }
+    logger.info("Auth code issued for client: %s", client_id)
+
+    sep = "&" if "?" in redirect_uri else "?"
+    url = f"{redirect_uri}{sep}code={code}"
+    if state:
+        url += f"&state={state}"
+    return RedirectResponse(url=url, status_code=302)
+
+
 @app.post("/oauth/token")
 async def token_endpoint(request: Request):
     body = await request.form()
     grant_type = body.get("grant_type", "")
 
-    if grant_type != "client_credentials":
-        return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
-
-    # Support Basic auth or form params
+    # Extract client credentials (Basic auth or form params)
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Basic "):
         decoded = base64.b64decode(auth_header[6:] + "==").decode(errors="replace")
@@ -673,18 +749,60 @@ async def token_endpoint(request: Request):
         client_id = body.get("client_id", "")
         client_secret = body.get("client_secret", "")
 
-    if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
-        return JSONResponse(status_code=401, content={"error": "invalid_client"})
+    # ── Authorization Code + PKCE ──────────────────────────────────────────
+    if grant_type == "authorization_code":
+        code = body.get("code", "")
+        code_verifier = body.get("code_verifier", "")
+        redirect_uri = body.get("redirect_uri", "")
 
-    scope = body.get("scope", "mcp:read mcp:write")
-    token = _issue_token(client_id, scope)
-    logger.info("Token issued for client: %s", client_id)
-    return JSONResponse(content={
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": OAUTH_TOKEN_EXPIRY,
-        "scope": scope,
-    })
+        code_data = _auth_codes.pop(code, None)
+        if not code_data or code_data["exp"] < int(time.time()):
+            return JSONResponse(status_code=400, content={"error": "invalid_grant"})
+
+        if code_data["client_id"] != client_id:
+            return JSONResponse(status_code=401, content={"error": "invalid_client"})
+
+        if code_data["redirect_uri"] != redirect_uri:
+            return JSONResponse(status_code=400, content={"error": "invalid_grant", "message": "redirect_uri mismatch"})
+
+        # PKCE verification (S256)
+        if code_data.get("code_challenge"):
+            challenge = base64.urlsafe_b64encode(
+                hashlib.sha256(code_verifier.encode()).digest()
+            ).rstrip(b"=").decode()
+            if challenge != code_data["code_challenge"]:
+                return JSONResponse(status_code=400, content={"error": "invalid_grant", "message": "PKCE verification failed"})
+
+        scope = code_data.get("scope", "mcp:read mcp:write")
+        token = _issue_token(client_id, scope)
+        logger.info("Token issued (authorization_code) for client: %s", client_id)
+        return JSONResponse(content={
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": OAUTH_TOKEN_EXPIRY,
+            "scope": scope,
+        })
+
+    # ── Client Credentials ─────────────────────────────────────────────────
+    if grant_type == "client_credentials":
+        is_static = (client_id == OAUTH_CLIENT_ID and client_secret == OAUTH_CLIENT_SECRET)
+        registered = _registered_clients.get(client_id)
+        is_registered = registered and registered["client_secret"] == client_secret
+
+        if not is_static and not is_registered:
+            return JSONResponse(status_code=401, content={"error": "invalid_client"})
+
+        scope = body.get("scope", "mcp:read mcp:write")
+        token = _issue_token(client_id, scope)
+        logger.info("Token issued (client_credentials) for client: %s", client_id)
+        return JSONResponse(content={
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": OAUTH_TOKEN_EXPIRY,
+            "scope": scope,
+        })
+
+    return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
 
 
 @app.get("/mcp")
