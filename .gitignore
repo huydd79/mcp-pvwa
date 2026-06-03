@@ -23,6 +23,7 @@ env/
 
 # Project internals
 prompt.md
+working.md
 
 # macOS
 .DS_Store
