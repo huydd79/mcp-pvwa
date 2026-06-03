@@ -21,6 +21,9 @@ env/
 # Docker
 .docker/
 
+# Project internals
+prompt.md
+
 # macOS
 .DS_Store
 
