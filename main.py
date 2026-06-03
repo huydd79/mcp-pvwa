@@ -509,6 +509,37 @@ async def health_check():
     return {"status": "online", "message": "CyberArk PVWA MCP Server is running"}
 
 
+# ---------------------------------------------------------------------------
+# OAuth / OpenID discovery endpoints (required by MCPGateway & mcp-remote)
+# ---------------------------------------------------------------------------
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+async def oauth_protected_resource():
+    return JSONResponse(content={
+        "resource": "https://testmcp.home.huydo.net",
+        "authorization_servers": [],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+    })
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_authorization_server():
+    return JSONResponse(content={"issuer": "none"})
+
+
+@app.get("/.well-known/openid-configuration")
+async def openid_configuration():
+    return JSONResponse(content={
+        "issuer": "none",
+        "authorization_endpoint": "none",
+        "token_endpoint": "none",
+        "jwks_uri": "none",
+        "response_types_supported": [],
+    })
+
+
 @app.get("/mcp")
 async def mcp_sse_channel(request: Request):
     """SSE channel for server-to-client messages (required by mcp-remote / streamable-http spec)."""
