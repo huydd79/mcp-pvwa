@@ -852,17 +852,31 @@ async def token_endpoint(request: Request):
     if USE_EXTERNAL_IDP:
         meta = await _get_idp_meta()
         idp_token_url = meta.get("token_endpoint", "")
-        form_data = dict(body)
-        if IDP_CLIENT_ID:
-            form_data["client_id"] = IDP_CLIENT_ID
+
+        # Build clean form_data — chỉ gửi những gì IdP cần
+        form_data: dict[str, str] = {
+            "grant_type": grant_type,
+            "client_id": IDP_CLIENT_ID,
+        }
         if IDP_CLIENT_SECRET:
             form_data["client_secret"] = IDP_CLIENT_SECRET
-        # Override scope với giá trị IdP hỗ trợ
-        form_data["scope"] = IDP_SCOPE
+
+        if grant_type == "authorization_code":
+            # Scope KHÔNG gửi ở bước này — IdP dùng scope từ authorization request
+            form_data["code"] = body.get("code", "")
+            form_data["redirect_uri"] = body.get("redirect_uri", "")
+            if body.get("code_verifier"):
+                form_data["code_verifier"] = body.get("code_verifier")
+        elif grant_type == "client_credentials":
+            form_data["scope"] = IDP_SCOPE
+
+        logger.info("Proxy token to IdP: %s (grant_type=%s)", idp_token_url, grant_type)
         async with httpx.AsyncClient() as c:
             r = await c.post(idp_token_url, data=form_data,
                              headers={"Content-Type": "application/x-www-form-urlencoded"})
-        return JSONResponse(status_code=r.status_code, content=r.json())
+        resp_data = r.json() if r.content else {}
+        logger.info("IdP token response: %s %s", r.status_code, resp_data.get("error", "ok"))
+        return JSONResponse(status_code=r.status_code, content=resp_data)
 
 
     # Extract client credentials (Basic auth or form params)
