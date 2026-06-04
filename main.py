@@ -2,23 +2,35 @@
 CyberArk PVWA MCP Server
 
 Manages privileged accounts via CyberArk Self-Hosted PAM REST API.
-Configuration via environment variables:
-  CYBERARK_PVWA_URL       - Base URL, e.g. https://my.pvwa.com
-  CYBERARK_AUTH_TYPE      - CyberArk | Windows | LDAP | RADIUS
-  CYBERARK_USERNAME       - PVWA username
-  CYBERARK_PASSWORD       - PVWA password
-  CYBERARK_VERIFY_SSL     - true (default) | false (for lab environments)
 
+Required:
+  CYBERARK_PVWA_URL       - Base URL, e.g. https://my.pvwa.com
+
+PVWA authentication (applied in priority order):
+  PVWA_SAML_ENABLED       - true | false (default false) — SAML-first via IdP token exchange
+  PVWA_SAML_APP_KEY        - PVWA entity/app ID at the IdP (required when SAML enabled)
+  CYBERARK_AUTH_TYPE      - CyberArk (default) | LDAP | Windows | RADIUS
+  CYBERARK_USERNAME       - Optional pre-configured username; prompted at runtime if absent
+  CYBERARK_PASSWORD       - Optional pre-configured password; prompted at runtime if absent
+  CYBERARK_VERIFY_SSL     - true (default) | false (lab only)
+
+MCP endpoint authentication:
   OAUTH_ENABLED           - true | false (default false)
-  OAUTH_ISSUER            - Public base URL, e.g. https://testmcp.home.huydo.net
-  OAUTH_CLIENT_ID         - OAuth client ID
-  OAUTH_CLIENT_SECRET     - OAuth client secret
+  OAUTH_ISSUER            - Public URL of this server
+  OAUTH_CLIENT_ID         - Static client ID (internal OAuth only)
+  OAUTH_CLIENT_SECRET     - Static client secret (internal OAuth only)
   OAUTH_TOKEN_EXPIRY      - Token TTL in seconds (default 3600)
-  OAUTH_PRIVATE_KEY_PEM   - RSA private key in PEM format (auto-generated if absent)
+  OAUTH_PRIVATE_KEY_PEM   - RSA private key PEM (auto-generated if absent)
+
+External IdP (overrides internal OAuth when set):
+  IDP_ISSUER              - Issuer URL of the external IdP
+  IDP_CLIENT_ID / IDP_CLIENT_SECRET / IDP_SCOPE / IDP_AUDIENCE
 """
 
 import os
+import re
 import json
+import xml.etree.ElementTree as ET
 import base64
 import hashlib
 import secrets
@@ -26,6 +38,7 @@ import uuid
 import time
 import logging
 import urllib.parse
+from contextvars import ContextVar
 from typing import Any, Optional
 
 import httpx
@@ -52,6 +65,9 @@ AUTH_TYPE = os.environ.get("CYBERARK_AUTH_TYPE", "CyberArk")
 USERNAME = os.environ.get("CYBERARK_USERNAME", "")
 PASSWORD = os.environ.get("CYBERARK_PASSWORD", "")
 VERIFY_SSL = os.environ.get("CYBERARK_VERIFY_SSL", "true").lower() != "false"
+PVWA_SAML_ENABLED = os.environ.get("PVWA_SAML_ENABLED", "false").lower() == "true"
+PVWA_SAML_APP_KEY = os.environ.get("PVWA_SAML_APP_KEY", "")   # SAML app key/UUID at the IdP
+PVWA_SAML_SSO_URL = os.environ.get("PVWA_SAML_SSO_URL", "")  # Direct IdP SSO URL (skips discovery)
 
 BASE_API = f"{PVWA_URL}/PasswordVault/API"
 
@@ -78,6 +94,9 @@ USE_EXTERNAL_IDP = bool(IDP_ISSUER or IDP_DISCOVERY_URL)
 _idp_meta: dict = {}
 _idp_jwks_cache: dict = {"keys": [], "at": 0}
 _JWKS_TTL = 3600
+
+# Per-request bearer token (set in MCP endpoint, read in PVWAClient for SAML)
+_bearer_ctx: ContextVar[str] = ContextVar("bearer", default="")
 
 _KID = str(uuid.uuid4())[:8]
 
@@ -142,7 +161,7 @@ async def _validate_idp_token(token: str) -> bool:
     try:
         from jwt.algorithms import RSAAlgorithm
 
-        # Log unverified claims để debug
+        # Log unverified claims for debugging
         try:
             unverified = pyjwt.decode(token, options={"verify_signature": False})
             logger.info("Token claims — iss: %s | aud: %s | exp: %s",
@@ -163,7 +182,7 @@ async def _validate_idp_token(token: str) -> bool:
         for key_data in matched:
             try:
                 public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
-                # Chỉ verify signature + expiry; bỏ qua iss/aud (IdP tự quản lý)
+                # Verify signature + expiry only; skip iss/aud (managed by IdP)
                 options = {"verify_aud": False, "verify_iss": False}
                 pyjwt.decode(token, public_key, algorithms=[alg], options=options)
                 logger.info("IdP token validated OK (kid=%s)", kid)
@@ -214,26 +233,281 @@ def _validate_token(authorization: str) -> bool:
 # PVWA HTTP client with automatic session management
 # ---------------------------------------------------------------------------
 
+def _parse_saml_response_from_html(html: str) -> Optional[str]:
+    """Extract the SAMLResponse value from an IdP HTML auto-submit form.
+
+    IdPs typically return a page like:
+      <form ...><input type="hidden" name="SAMLResponse" value="<base64>"/></form>
+    Handles both attribute orderings (name before value, value before name).
+    """
+    patterns = [
+        r'name=["\']SAMLResponse["\'][^>]+value=["\']([A-Za-z0-9+/=\s]+)["\']',
+        r'value=["\']([A-Za-z0-9+/=\s]+)["\'][^>]+name=["\']SAMLResponse["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1).replace("\n", "").replace(" ", "")
+    return None
+
+
 class PVWAClient:
-    """Async HTTP client for CyberArk PVWA with automatic token lifecycle."""
+    """Async HTTP client for CyberArk PVWA with automatic token lifecycle.
+
+    Authentication priority (each step falls back to the next if unavailable):
+      1. SAML SP-initiated — when PVWA_SAML_ENABLED=true and a Bearer token is present:
+         a. SP-initiated: GET PVWA SAML init URL → follow redirect to IdP → parse SAMLResponse.
+         b. IdP-initiated: call IdP SAML SSO endpoint directly (needs PVWA_SAML_APP_KEY).
+      2. Direct credentials — CYBERARK_USERNAME/PASSWORD env vars.
+      3. User-provided — username/password/auth_type passed explicitly to _logon().
+         If none of the above is available, raises PermissionError with instructions.
+    """
 
     def __init__(self) -> None:
         self._token: Optional[str] = None
+        self._saml_session: bool = False  # True when logged in via SAML
         self._client = httpx.AsyncClient(verify=VERIFY_SSL)
 
-    async def _logon(self) -> None:
-        url = f"{BASE_API}/auth/{AUTH_TYPE}/Logon"
-        payload = {"username": USERNAME, "password": PASSWORD, "concurrentSession": True}
+    # ------------------------------------------------------------------
+    # SAML helpers
+    # ------------------------------------------------------------------
+
+    async def _get_saml_assertion(self, bearer_token: str) -> Optional[str]:
+        """Obtain a SAML assertion for PVWA using SP-initiated or IdP-initiated flow.
+
+        Tries in order:
+          a. SP-initiated: PVWA redirects to IdP → IdP issues SAMLResponse.
+          b. IdP-initiated: call IdP SAML SSO endpoint directly (needs PVWA_SAML_APP_KEY).
+        Returns the base64-encoded SAMLResponse string ready for PVWA, or None.
+        """
+        saml = await self._saml_sp_initiated(bearer_token)
+        if saml:
+            return saml
+        if PVWA_SAML_SSO_URL or PVWA_SAML_APP_KEY:
+            saml = await self._saml_idp_initiated(bearer_token)
+        return saml
+
+    async def _discover_idp_saml_sso_url(self) -> Optional[str]:
+        """Fetch IdP SAML metadata XML and extract the SingleSignOnService URL.
+
+        Tries standard metadata endpoint patterns for CyberArk Identity.
+        Returns the HTTP-POST (preferred) or HTTP-Redirect SSO URL, or None.
+        """
+        base = IDP_ISSUER.rstrip("/")
+        metadata_candidates = [
+            f"{base}/saml/saml2/metadata",
+            f"{base}/saml2/metadata",
+            f"{base}/SAML20/saml2/metadata",
+        ]
+        NS = "urn:oasis:names:tc:SAML:2.0:metadata"
+        for meta_url in metadata_candidates:
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.get(meta_url, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                root = ET.fromstring(r.text)
+                post_url = redirect_url = None
+                for sso in root.iter(f"{{{NS}}}SingleSignOnService"):
+                    binding = sso.get("Binding", "")
+                    loc = sso.get("Location", "")
+                    if "HTTP-POST" in binding:
+                        post_url = loc
+                    elif "HTTP-Redirect" in binding:
+                        redirect_url = loc
+                sso_url = post_url or redirect_url
+                if sso_url:
+                    logger.info("SAML metadata (%s): SSO URL = %s", meta_url, sso_url)
+                    return sso_url
+                logger.debug("SAML metadata (%s): parsed OK but no SSO URL found", meta_url)
+            except Exception as e:
+                logger.debug("SAML metadata %s: %s: %s", meta_url, type(e).__name__, e)
+        return None
+
+    async def _saml_sp_initiated(self, bearer_token: str) -> Optional[str]:
+        """SP-initiated SAML flow.
+
+        1. GET PVWA SAML initiation URL — PVWA redirects to IdP SSO with SAMLRequest.
+        2. GET IdP SSO URL with Bearer token as Authorization header.
+        3. Parse SAMLResponse from IdP's HTML auto-submit form.
+
+        Requires PVWA to be reachable from the MCP server container.
+        """
+        try:
+            pvwa_init = f"{PVWA_URL}/PasswordVault/v10/Logon/SAML"
+            async with httpx.AsyncClient(verify=VERIFY_SSL, timeout=10) as c:
+                r = await c.get(pvwa_init, follow_redirects=False)
+
+            if r.status_code not in (301, 302):
+                logger.debug("SP-initiated: PVWA init returned %s (expected redirect)", r.status_code)
+                return None
+
+            idp_sso_url = r.headers.get("location", "")
+            if not idp_sso_url:
+                logger.debug("SP-initiated: no Location header in PVWA redirect")
+                return None
+
+            logger.info("SP-initiated: PVWA → IdP SSO: %.100s", idp_sso_url)
+
+            async with httpx.AsyncClient(timeout=15) as c:
+                r2 = await c.get(
+                    idp_sso_url,
+                    headers={"Authorization": f"Bearer {bearer_token}"},
+                    follow_redirects=True,
+                )
+
+            if r2.status_code != 200:
+                logger.warning("SP-initiated: IdP SSO returned %s", r2.status_code)
+                return None
+
+            saml = _parse_saml_response_from_html(r2.text)
+            if saml:
+                logger.info("SP-initiated: SAMLResponse obtained (%d chars)", len(saml))
+            else:
+                logger.warning("SP-initiated: IdP returned 200 but no SAMLResponse in HTML")
+            return saml
+        except Exception as e:
+            logger.warning("SP-initiated SAML failed: %s: %s", type(e).__name__, e)
+        return None
+
+    async def _saml_idp_initiated(self, bearer_token: str) -> Optional[str]:
+        """IdP-initiated SAML via direct call to IdP SAML SSO endpoint.
+
+        Priority:
+          1. PVWA_SAML_SSO_URL (explicit config, skips all discovery).
+          2. SSO URL discovered from IdP SAML metadata XML.
+          3. Known CyberArk Identity URL patterns derived from IDP_ISSUER + PVWA_SAML_APP_KEY.
+        All requests carry the OAuth Bearer token as Authorization header.
+        """
+        base = IDP_ISSUER.rstrip("/")
+        candidates: list[str] = []
+
+        # Priority 1: explicit SSO URL
+        if PVWA_SAML_SSO_URL:
+            candidates.append(PVWA_SAML_SSO_URL)
+        else:
+            # Priority 2: discover from IdP SAML metadata
+            discovered = await self._discover_idp_saml_sso_url()
+            if discovered:
+                sep = "&" if "?" in discovered else "?"
+                if PVWA_SAML_APP_KEY:
+                    candidates.append(f"{discovered}{sep}appkey={PVWA_SAML_APP_KEY}")
+                candidates.append(discovered)
+
+            # Priority 3: CyberArk Identity known URL patterns
+            if PVWA_SAML_APP_KEY:
+                candidates += [
+                    f"{base}/saml/samlp/{PVWA_SAML_APP_KEY}/login",
+                    f"{base}/saml/samlp/{PVWA_SAML_APP_KEY}/idpinit",
+                    f"{base}/sso/saml/{PVWA_SAML_APP_KEY}/sso",
+                    f"{base}/saml20/sso?appkey={PVWA_SAML_APP_KEY}",
+                ]
+
+        for url in candidates:
+            try:
+                logger.info("IdP-initiated: trying %s", url)
+                async with httpx.AsyncClient(timeout=15) as c:
+                    r = await c.get(
+                        url,
+                        headers={"Authorization": f"Bearer {bearer_token}"},
+                        follow_redirects=True,
+                    )
+                if r.status_code == 200:
+                    saml = _parse_saml_response_from_html(r.text)
+                    if saml:
+                        logger.info("IdP-initiated: SAMLResponse obtained from %s (%d chars)", url, len(saml))
+                        return saml
+                    logger.debug("IdP-initiated: %s → 200 but no SAMLResponse (ct: %s)",
+                                 url, r.headers.get("content-type", "?"))
+                else:
+                    logger.debug("IdP-initiated: %s → %s", url, r.status_code)
+            except Exception as e:
+                logger.warning("IdP-initiated: %s failed: %s: %s", url, type(e).__name__, e)
+        return None
+
+    async def _logon_saml(self, saml_assertion: str) -> None:
+        """POST SAMLResponse to PVWA SAML logon endpoint."""
+        url = f"{BASE_API}/auth/SAML/Logon"
+        try:
+            xml = base64.b64decode(saml_assertion.encode()).decode(errors="replace")
+            m = re.search(r'\bDestination=["\']([^"\']+)["\']', xml)
+            logger.info("SAML Destination: %s | PVWA API URL: %s",
+                        m.group(1) if m else "NOT FOUND", url)
+        except Exception:
+            pass
+        resp = await self._client.post(
+            url,
+            data={"SAMLResponse": saml_assertion, "apiUse": "True", "concurrentSession": "True"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if not resp.is_success:
+            logger.warning("PVWA SAML logon %s — body: %.500s", resp.status_code, resp.text)
+        resp.raise_for_status()
+        try:
+            self._token = resp.json()
+        except Exception:
+            self._token = resp.text.strip().strip('"')
+        self._saml_session = True
+        logger.info("PVWA SAML session established.")
+
+    # ------------------------------------------------------------------
+    # Core logon / logoff
+    # ------------------------------------------------------------------
+
+    async def _logon(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        auth_type: Optional[str] = None,
+    ) -> None:
+        """Multi-strategy logon.
+
+        Priority: SAML (OAuth Bearer) → env-var credentials → tool-provided credentials.
+        Raises PermissionError with guidance when no credentials are available.
+        """
+        # Strategy 1: SAML via IdP token exchange
+        if PVWA_SAML_ENABLED and USE_EXTERNAL_IDP:
+            bearer = _bearer_ctx.get()
+            if bearer:
+                saml = await self._get_saml_assertion(bearer)
+                if saml:
+                    try:
+                        await self._logon_saml(saml)
+                        return
+                    except Exception as e:
+                        logger.warning("SAML logon failed (%s) — falling back to direct auth.", e)
+
+        # Strategy 2 + 3: Direct credentials (env vars, then tool-provided args)
+        _username = username or USERNAME
+        _password = password or PASSWORD
+        _auth_type = auth_type or AUTH_TYPE
+
+        if not _username or not _password:
+            raise PermissionError(
+                "No PVWA credentials available. "
+                "Set CYBERARK_USERNAME and CYBERARK_PASSWORD environment variables, "
+                "or call cyberark_logon(username=..., password=..., auth_type=...) directly. "
+                "Supported auth_type values: CyberArk (default), LDAP, Windows, RADIUS."
+            )
+
+        url = f"{BASE_API}/auth/{_auth_type}/Logon"
+        payload = {"username": _username, "password": _password, "concurrentSession": True}
         resp = await self._client.post(url, json=payload)
         resp.raise_for_status()
-        self._token = resp.json()
-        logger.info("PVWA session established.")
+        try:
+            self._token = resp.json()
+        except Exception:
+            self._token = resp.text.strip().strip('"')
+        self._saml_session = False
+        logger.info("PVWA session established (auth_type=%s).", _auth_type)
 
     async def _logoff(self) -> None:
         if not self._token:
             return
-        await self._client.post(f"{BASE_API}/Auth/Logoff/", headers=self._auth_headers())
+        logoff_path = "/auth/SAML/Logoff" if self._saml_session else "/Auth/Logoff/"
+        await self._client.post(f"{BASE_API}{logoff_path}", headers=self._auth_headers())
         self._token = None
+        self._saml_session = False
         logger.info("PVWA session terminated.")
 
     def _auth_headers(self) -> dict[str, str]:
@@ -275,8 +549,35 @@ TOOLS = [
     # ── Authentication ──────────────────────────────────────────────────────
     {
         "name": "cyberark_logon",
-        "description": "Authenticate to CyberArk PVWA and obtain a session token. Uses credentials from server environment variables. Call this only to manually re-establish a session.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Authenticate to CyberArk PVWA and obtain a session token. "
+            "Authentication priority: "
+            "(1) SAML via the active OAuth/IdP session when PVWA_SAML_ENABLED=true; "
+            "(2) CYBERARK_USERNAME/PASSWORD environment variables; "
+            "(3) username/password/auth_type supplied to this tool. "
+            "Call with explicit credentials when env vars are not configured "
+            "or when you need to authenticate as a different user."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "PVWA username. Overrides CYBERARK_USERNAME env var.",
+                },
+                "password": {
+                    "type": "string",
+                    "description": "PVWA password. Overrides CYBERARK_PASSWORD env var.",
+                },
+                "auth_type": {
+                    "type": "string",
+                    "description": (
+                        "Authentication method. Overrides CYBERARK_AUTH_TYPE env var. "
+                        "Allowed values: CyberArk (default), LDAP, Windows, RADIUS."
+                    ),
+                },
+            },
+        },
     },
     {
         "name": "cyberark_logoff",
@@ -486,8 +787,12 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 async def tool_cyberark_logon(args: dict) -> dict:
-    await client._logon()
-    return _text("Successfully authenticated to PVWA.")
+    username = args.get("username") or None
+    password = args.get("password") or None
+    auth_type = args.get("auth_type") or None
+    await client._logon(username=username, password=password, auth_type=auth_type)
+    method = "SAML" if client._saml_session else (auth_type or AUTH_TYPE)
+    return _text(f"Successfully authenticated to PVWA (method: {method}).")
 
 
 async def tool_cyberark_logoff(args: dict) -> dict:
@@ -500,7 +805,10 @@ async def tool_cyberark_get_health_summary(args: dict) -> dict:
 
 
 async def tool_cyberark_get_health_details(args: dict) -> dict:
-    return _text(await client.request("GET", f"/ComponentsMonitoringDetails/{args['component_id']}"))
+    cid = args.get("component_id", "").strip()
+    if not cid:
+        return _text("component_id is required. Valid values: PVWA, SessionManagement, CPM, PSM, AIM")
+    return _text(await client.request("GET", f"/ComponentsMonitoringDetails/{cid}"))
 
 
 async def tool_cyberark_list_accounts(args: dict) -> dict:
@@ -725,7 +1033,7 @@ async def oauth_authorization_server():
         meta = await _get_idp_meta()
         return JSONResponse(content={
             "issuer": meta.get("issuer", IDP_ISSUER),
-            # Trỏ về proxy của chúng ta — để scope override hoạt động
+            # Point to our proxy so scope override works correctly
             "authorization_endpoint": f"{OAUTH_ISSUER}/oauth/authorize",
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "jwks_uri": meta.get("jwks_uri", ""),
@@ -835,7 +1143,7 @@ async def authorize(request: Request):
         fwd = {
             **params,
             "client_id": IDP_CLIENT_ID or client_id,
-            "scope": IDP_SCOPE,  # override với scope IdP hỗ trợ
+            "scope": IDP_SCOPE,  # override with IdP-supported scope
         }
         qs = urllib.parse.urlencode(fwd)
         return RedirectResponse(url=f"{idp_auth_url}?{qs}", status_code=302)
@@ -876,7 +1184,7 @@ async def token_endpoint(request: Request):
         meta = await _get_idp_meta()
         idp_token_url = meta.get("token_endpoint", "")
 
-        # Build clean form_data — chỉ gửi những gì IdP cần
+        # Build clean form_data — send only what the IdP requires
         form_data: dict[str, str] = {
             "grant_type": grant_type,
             "client_id": IDP_CLIENT_ID,
@@ -885,7 +1193,7 @@ async def token_endpoint(request: Request):
             form_data["client_secret"] = IDP_CLIENT_SECRET
 
         if grant_type == "authorization_code":
-            # Scope KHÔNG gửi ở bước này — IdP dùng scope từ authorization request
+            # Do not send scope here — IdP uses the scope from the authorization request
             form_data["code"] = body.get("code", "")
             form_data["redirect_uri"] = body.get("redirect_uri", "")
             if body.get("code_verifier"):
@@ -986,12 +1294,17 @@ async def mcp_sse_channel(request: Request):
 
 @app.post("/mcp")
 async def mcp_endpoint(payload: dict, request: Request):
-    if not await _auth_ok(request.headers.get("Authorization", "")):
+    authorization = request.headers.get("Authorization", "")
+    if not await _auth_ok(authorization):
         return JSONResponse(
             status_code=401,
             headers={"WWW-Authenticate": f'Bearer realm="{IDP_ISSUER or OAUTH_ISSUER}"'},
             content={"error": "Unauthorized", "message": "Valid Bearer token required"},
         )
+
+    # Make the caller's Bearer token available to PVWAClient for SAML logon
+    if authorization.startswith("Bearer "):
+        _bearer_ctx.set(authorization[7:])
 
     method = payload.get("method")
     req_id = payload.get("id", 1)
@@ -1055,10 +1368,12 @@ async def mcp_endpoint(payload: dict, request: Request):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not PVWA_URL or not USERNAME or not PASSWORD:
-        logger.error(
-            "Missing required environment variables: "
-            "CYBERARK_PVWA_URL, CYBERARK_USERNAME, CYBERARK_PASSWORD"
-        )
+    if not PVWA_URL:
+        logger.error("Missing required environment variable: CYBERARK_PVWA_URL")
         raise SystemExit(1)
+    if not USERNAME or not PASSWORD:
+        logger.warning(
+            "CYBERARK_USERNAME / CYBERARK_PASSWORD not set — "
+            "credentials will be requested at runtime via the cyberark_logon tool."
+        )
     uvicorn.run(app, host="0.0.0.0", port=8000)
