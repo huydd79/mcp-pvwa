@@ -1543,7 +1543,7 @@ async def tool_cyberark_list_recordings(args: dict) -> dict:
     if args.get("to_time"):
         params["ToTime"] = args["to_time"]
     if args.get("sort"):
-        params["Sort"] = args["sort"]
+        params["sort"] = args["sort"]
     return _text(await client.request("GET", "/Recordings/", params=params))
 
 
