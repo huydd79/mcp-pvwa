@@ -1075,7 +1075,7 @@ TOOLS = [
     # ── Recordings ───────────────────────────────────────────────────────────
     {
         "name": "cyberark_list_recordings",
-        "description": "List PSM session recordings stored in the Vault.",
+        "description": "List PSM session recordings stored in the Vault. The numeric SessionId field in each result is the ID to pass to cyberark_get_recording and cyberark_get_recording_activities.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1091,22 +1091,22 @@ TOOLS = [
     },
     {
         "name": "cyberark_get_recording",
-        "description": "Get details of a specific PSM session recording by its recording ID.",
+        "description": "Get details of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "string", "description": "Recording ID (GUID)."},
+                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings (e.g. 42). Do not use SessionGuid."},
             },
             "required": ["recording_id"],
         },
     },
     {
         "name": "cyberark_get_recording_activities",
-        "description": "Get the activity log of a specific PSM session recording.",
+        "description": "Get the activity log of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "string", "description": "Recording ID (GUID)."},
+                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings (e.g. 42). Do not use SessionGuid."},
             },
             "required": ["recording_id"],
         },
