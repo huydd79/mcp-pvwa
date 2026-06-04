@@ -1085,28 +1085,27 @@ TOOLS = [
                 "to_time": {"type": "integer", "description": "End of time range as Unix timestamp."},
                 "limit": {"type": "integer", "description": "Maximum recordings to return (default 25)."},
                 "offset": {"type": "integer", "description": "Pagination start index (default 0)."},
-                "sort": {"type": "string", "description": "Sort expression, e.g. 'StartTime desc'."},
             },
         },
     },
     {
         "name": "cyberark_get_recording",
-        "description": "Get details of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid).",
+        "description": "Get details of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid). NOTE: Live session IDs like '32_515' are NOT recording IDs — you must call cyberark_list_recordings first and use the SessionId field from the results.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings (e.g. 42). Do not use SessionGuid."},
+                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings results (e.g. 42). Do NOT use SessionGuid or live-session notation like '32_515'."},
             },
             "required": ["recording_id"],
         },
     },
     {
         "name": "cyberark_get_recording_activities",
-        "description": "Get the activity log of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid).",
+        "description": "Get the activity log of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid). NOTE: Live session IDs like '32_515' are NOT recording IDs — you must call cyberark_list_recordings first and use the SessionId field from the results.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings (e.g. 42). Do not use SessionGuid."},
+                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings results (e.g. 42). Do NOT use SessionGuid or live-session notation like '32_515'."},
             },
             "required": ["recording_id"],
         },
@@ -1542,8 +1541,6 @@ async def tool_cyberark_list_recordings(args: dict) -> dict:
         params["FromTime"] = args["from_time"]
     if args.get("to_time"):
         params["ToTime"] = args["to_time"]
-    if args.get("sort"):
-        params["sort"] = args["sort"]
     return _text(await client.request("GET", "/Recordings/", params=params))
 
 
@@ -1552,7 +1549,7 @@ async def tool_cyberark_get_recording(args: dict) -> dict:
 
 
 async def tool_cyberark_get_recording_activities(args: dict) -> dict:
-    return _text(await client.request("GET", f"/Recordings/{args['recording_id']}/activities/"))
+    return _text(await client.request("GET", f"/Recordings/{args['recording_id']}/activities"))
 
 
 TOOL_HANDLERS: dict[str, Any] = {
