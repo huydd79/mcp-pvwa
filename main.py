@@ -1090,22 +1090,22 @@ TOOLS = [
     },
     {
         "name": "cyberark_get_recording",
-        "description": "Get details of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid). NOTE: Live session IDs like '32_515' are NOT recording IDs — you must call cyberark_list_recordings first and use the SessionId field from the results.",
+        "description": "Get details of a specific PSM session recording. Use the SessionID string from cyberark_list_recordings (e.g. '32_515'). Do not use SessionGuid.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings results (e.g. 42). Do NOT use SessionGuid or live-session notation like '32_515'."},
+                "recording_id": {"type": "string", "description": "SessionID string from cyberark_list_recordings results, e.g. '32_515'. Do NOT use SessionGuid."},
             },
             "required": ["recording_id"],
         },
     },
     {
         "name": "cyberark_get_recording_activities",
-        "description": "Get the activity log of a specific PSM session recording. Use the numeric SessionId from cyberark_list_recordings (not the SessionGuid). NOTE: Live session IDs like '32_515' are NOT recording IDs — you must call cyberark_list_recordings first and use the SessionId field from the results.",
+        "description": "Get the activity log of a specific PSM session recording. Use the SessionID string from cyberark_list_recordings (e.g. '32_515'). Do not use SessionGuid.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "recording_id": {"type": "integer", "description": "Numeric SessionId from cyberark_list_recordings results (e.g. 42). Do NOT use SessionGuid or live-session notation like '32_515'."},
+                "recording_id": {"type": "string", "description": "SessionID string from cyberark_list_recordings results, e.g. '32_515'. Do NOT use SessionGuid."},
             },
             "required": ["recording_id"],
         },
