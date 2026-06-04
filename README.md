@@ -4,7 +4,7 @@ A **Model Context Protocol (MCP) Server** that exposes the CyberArk Self-Hosted 
 
 ## Features
 
-- **15 MCP tools** — Authentication, System Health, Accounts, Safe management
+- **41 MCP tools** — Authentication, System Health, Accounts, Safes, Users, Groups, Live Sessions, Recordings
 - **SAML SSO into PVWA** — uses the caller's active IdP session (no separate PVWA credentials needed)
 - **OAuth 2.1 protection** — MCP endpoint secured via CyberArk Identity, Okta, or Azure AD
 - **Credential fallback** — direct PVWA login if SAML is unavailable; credentials can also be supplied at runtime
@@ -63,6 +63,32 @@ A **Model Context Protocol (MCP) Server** that exposes the CyberArk Self-Hosted 
 | Safes | `cyberark_delete_safe` | Permanently delete a Safe |
 | Safes | `cyberark_list_safe_members` | List members and their permissions |
 | Safes | `cyberark_add_safe_member` | Add a user/group to a Safe with permissions |
+| Users | `cyberark_list_users` | List Vault users with optional filters |
+| Users | `cyberark_get_user` | Get full details of a user by ID |
+| Users | `cyberark_add_user` | Create a new Vault user |
+| Users | `cyberark_update_user` | Update user properties |
+| Users | `cyberark_delete_user` | Permanently delete a user |
+| Users | `cyberark_activate_user` | Activate a suspended user |
+| Users | `cyberark_enable_user` | Enable a disabled user |
+| Users | `cyberark_disable_user` | Disable a user (block login) |
+| Users | `cyberark_reset_user_password` | Reset a user's password |
+| Groups | `cyberark_list_groups` | List Vault user groups |
+| Groups | `cyberark_get_group` | Get group details with optional member list |
+| Groups | `cyberark_create_group` | Create a new Vault group |
+| Groups | `cyberark_update_group` | Rename a group |
+| Groups | `cyberark_delete_group` | Delete a group |
+| Groups | `cyberark_add_group_member` | Add a user to a group |
+| Groups | `cyberark_remove_group_member` | Remove a user from a group |
+| Sessions | `cyberark_list_live_sessions` | List active PSM sessions |
+| Sessions | `cyberark_get_live_session` | Get details of a live session |
+| Sessions | `cyberark_get_session_activities` | Get activity log of a live session |
+| Sessions | `cyberark_monitor_session` | Get monitoring connection details |
+| Sessions | `cyberark_suspend_session` | Suspend a live session |
+| Sessions | `cyberark_resume_session` | Resume a suspended session |
+| Sessions | `cyberark_terminate_session` | Forcefully terminate a session |
+| Recordings | `cyberark_list_recordings` | List PSM session recordings |
+| Recordings | `cyberark_get_recording` | Get recording details |
+| Recordings | `cyberark_get_recording_activities` | Get recording activity log |
 
 ---
 

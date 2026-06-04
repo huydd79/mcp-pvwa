@@ -780,6 +780,337 @@ TOOLS = [
             "required": ["safe_id", "member_name"],
         },
     },
+    # ── Users ────────────────────────────────────────────────────────────────
+    {
+        "name": "cyberark_list_users",
+        "description": "List Vault users with optional filters.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Free-text search across username and description."},
+                "filter": {"type": "string", "description": "Filter expression, e.g. 'componentUser eq false'."},
+                "extended_details": {"type": "boolean", "description": "Return extended user metadata (default false)."},
+                "sort": {"type": "string", "description": "Sort expression, e.g. 'username asc'."},
+                "page_offset": {"type": "integer", "description": "Pagination offset (default 0)."},
+                "page_size": {"type": "integer", "description": "Results per page (default 25)."},
+            },
+        },
+    },
+    {
+        "name": "cyberark_get_user",
+        "description": "Get full details of a single Vault user by their numeric user ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID."},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_add_user",
+        "description": "Create a new Vault user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "Unique login name for the new user."},
+                "user_type": {"type": "string", "description": "User type, e.g. EPVUser, BasicUser, or BizUser."},
+                "initial_password": {"type": "string", "description": "Initial password (required for CyberArk-authenticated users)."},
+                "authentication_method": {"type": "array", "items": {"type": "string"}, "description": "Authentication methods, e.g. [\"CyberArk\"] or [\"LDAP\"]."},
+                "location": {"type": "string", "description": "Vault folder location (default root '\\\\')."},
+                "description": {"type": "string", "description": "Free-text description."},
+                "enable_user": {"type": "boolean", "description": "Whether the account is enabled on creation (default true)."},
+                "change_pass_on_next_logon": {"type": "boolean", "description": "Force password change on first login."},
+                "password_never_expires": {"type": "boolean", "description": "Disable password expiry."},
+                "expiry_date": {"type": "integer", "description": "Account expiry as Unix timestamp (0 = never)."},
+            },
+            "required": ["username", "initial_password"],
+        },
+    },
+    {
+        "name": "cyberark_update_user",
+        "description": "Update properties of an existing Vault user. Only provided fields are modified.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID to update."},
+                "enable_user": {"type": "boolean"},
+                "change_pass_on_next_logon": {"type": "boolean"},
+                "password_never_expires": {"type": "boolean"},
+                "expiry_date": {"type": "integer", "description": "Account expiry as Unix timestamp (0 = never)."},
+                "description": {"type": "string"},
+                "location": {"type": "string"},
+                "authentication_method": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_delete_user",
+        "description": "Permanently delete a Vault user. This action is irreversible.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID to delete."},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_activate_user",
+        "description": "Activate a suspended Vault user account.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID to activate."},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_enable_user",
+        "description": "Enable a disabled Vault user account.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID to enable."},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_disable_user",
+        "description": "Disable a Vault user account (user cannot log in).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID to disable."},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
+        "name": "cyberark_reset_user_password",
+        "description": "Reset the password of a Vault user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "Numeric Vault user ID."},
+                "new_password": {"type": "string", "description": "New password to set for the user."},
+            },
+            "required": ["user_id", "new_password"],
+        },
+    },
+    # ── User Groups ──────────────────────────────────────────────────────────
+    {
+        "name": "cyberark_list_groups",
+        "description": "List Vault user groups with optional filters.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Search groups by name."},
+                "filter": {"type": "string", "description": "Filter expression, e.g. 'groupType eq Vault'."},
+                "sort": {"type": "string", "description": "Sort expression, e.g. 'groupName asc'."},
+                "include_members": {"type": "boolean", "description": "Include member list in each group (default false)."},
+            },
+        },
+    },
+    {
+        "name": "cyberark_get_group",
+        "description": "Get details of a Vault user group by its numeric group ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "Numeric Vault group ID."},
+                "include_members": {"type": "boolean", "description": "Include member list (default false)."},
+            },
+            "required": ["group_id"],
+        },
+    },
+    {
+        "name": "cyberark_create_group",
+        "description": "Create a new Vault user group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_name": {"type": "string", "description": "Unique name for the new group."},
+                "description": {"type": "string", "description": "Optional description."},
+                "location": {"type": "string", "description": "Vault folder location (default root '\\\\')."},
+            },
+            "required": ["group_name"],
+        },
+    },
+    {
+        "name": "cyberark_update_group",
+        "description": "Rename a Vault user group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "Numeric Vault group ID."},
+                "group_name": {"type": "string", "description": "New name for the group."},
+            },
+            "required": ["group_id", "group_name"],
+        },
+    },
+    {
+        "name": "cyberark_delete_group",
+        "description": "Delete a Vault user group. This action is irreversible.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "Numeric Vault group ID to delete."},
+            },
+            "required": ["group_id"],
+        },
+    },
+    {
+        "name": "cyberark_add_group_member",
+        "description": "Add a user to a Vault group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "Numeric Vault group ID."},
+                "member_id": {"type": "integer", "description": "Numeric Vault user ID to add."},
+                "member_type": {"type": "string", "description": "Member type: vault (default) or domain."},
+                "domain_name": {"type": "string", "description": "Domain name (required for domain member type)."},
+            },
+            "required": ["group_id", "member_id"],
+        },
+    },
+    {
+        "name": "cyberark_remove_group_member",
+        "description": "Remove a user from a Vault group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "Numeric Vault group ID."},
+                "member_name": {"type": "string", "description": "Username of the member to remove."},
+            },
+            "required": ["group_id", "member_name"],
+        },
+    },
+    # ── Live Sessions ────────────────────────────────────────────────────────
+    {
+        "name": "cyberark_list_live_sessions",
+        "description": "List currently active PSM sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Search across session properties."},
+                "safe": {"type": "string", "description": "Filter sessions by Safe name."},
+                "from_time": {"type": "integer", "description": "Start of time range as Unix timestamp."},
+                "to_time": {"type": "integer", "description": "End of time range as Unix timestamp."},
+                "limit": {"type": "integer", "description": "Maximum sessions to return (default 25)."},
+                "offset": {"type": "integer", "description": "Pagination start index (default 0)."},
+                "sort": {"type": "string", "description": "Sort expression, e.g. 'StartTime desc'."},
+            },
+        },
+    },
+    {
+        "name": "cyberark_get_live_session",
+        "description": "Get details of a specific active PSM session by its session ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID)."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "cyberark_get_session_activities",
+        "description": "Get the activity log of a specific active PSM session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID)."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "cyberark_monitor_session",
+        "description": "Get the monitoring connection details for a live PSM session (returns a monitoring URL or token).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID)."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "cyberark_suspend_session",
+        "description": "Suspend an active PSM session, temporarily blocking user input.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID) to suspend."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "cyberark_resume_session",
+        "description": "Resume a previously suspended PSM session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID) to resume."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "cyberark_terminate_session",
+        "description": "Forcefully terminate an active PSM session. This immediately disconnects the user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Live session ID (GUID) to terminate."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    # ── Recordings ───────────────────────────────────────────────────────────
+    {
+        "name": "cyberark_list_recordings",
+        "description": "List PSM session recordings stored in the Vault.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Search across recording properties."},
+                "safe": {"type": "string", "description": "Filter recordings by Safe name."},
+                "from_time": {"type": "integer", "description": "Start of time range as Unix timestamp."},
+                "to_time": {"type": "integer", "description": "End of time range as Unix timestamp."},
+                "limit": {"type": "integer", "description": "Maximum recordings to return (default 25)."},
+                "offset": {"type": "integer", "description": "Pagination start index (default 0)."},
+                "sort": {"type": "string", "description": "Sort expression, e.g. 'StartTime desc'."},
+            },
+        },
+    },
+    {
+        "name": "cyberark_get_recording",
+        "description": "Get details of a specific PSM session recording by its recording ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recording_id": {"type": "string", "description": "Recording ID (GUID)."},
+            },
+            "required": ["recording_id"],
+        },
+    },
+    {
+        "name": "cyberark_get_recording_activities",
+        "description": "Get the activity log of a specific PSM session recording.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recording_id": {"type": "string", "description": "Recording ID (GUID)."},
+            },
+            "required": ["recording_id"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -952,6 +1283,229 @@ async def tool_cyberark_add_safe_member(args: dict) -> dict:
     return _text(await client.request("POST", f"/Safes/{args['safe_id']}/Members/", json=payload))
 
 
+# ── User handlers ────────────────────────────────────────────────────────────
+
+async def tool_cyberark_list_users(args: dict) -> dict:
+    params: dict[str, Any] = {}
+    if args.get("search"):
+        params["search"] = args["search"]
+    if args.get("filter"):
+        params["filter"] = args["filter"]
+    if args.get("extended_details"):
+        params["ExtendedDetails"] = args["extended_details"]
+    if args.get("sort"):
+        params["sort"] = args["sort"]
+    if args.get("page_offset") is not None:
+        params["pageOffset"] = args["page_offset"]
+    if args.get("page_size") is not None:
+        params["pageSize"] = args["page_size"]
+    return _text(await client.request("GET", "/Users/", params=params or None))
+
+
+async def tool_cyberark_get_user(args: dict) -> dict:
+    return _text(await client.request("GET", f"/Users/{args['user_id']}/"))
+
+
+async def tool_cyberark_add_user(args: dict) -> dict:
+    payload: dict[str, Any] = {
+        "username": args["username"],
+        "initialPassword": args["initial_password"],
+    }
+    if args.get("user_type"):
+        payload["userType"] = args["user_type"]
+    if args.get("authentication_method"):
+        payload["authenticationMethod"] = args["authentication_method"]
+    if args.get("location"):
+        payload["location"] = args["location"]
+    if args.get("description"):
+        payload["description"] = args["description"]
+    if args.get("enable_user") is not None:
+        payload["enableUser"] = args["enable_user"]
+    if args.get("change_pass_on_next_logon") is not None:
+        payload["changePassOnNextLogon"] = args["change_pass_on_next_logon"]
+    if args.get("password_never_expires") is not None:
+        payload["passwordNeverExpires"] = args["password_never_expires"]
+    if args.get("expiry_date") is not None:
+        payload["expiryDate"] = args["expiry_date"]
+    return _text(await client.request("POST", "/Users/", json=payload))
+
+
+async def tool_cyberark_update_user(args: dict) -> dict:
+    user_id = args["user_id"]
+    payload: dict[str, Any] = {}
+    for src, dst in [
+        ("enable_user", "enableUser"),
+        ("change_pass_on_next_logon", "changePassOnNextLogon"),
+        ("password_never_expires", "passwordNeverExpires"),
+        ("expiry_date", "expiryDate"),
+        ("description", "description"),
+        ("location", "location"),
+        ("authentication_method", "authenticationMethod"),
+    ]:
+        if args.get(src) is not None:
+            payload[dst] = args[src]
+    if not payload:
+        return _text("No fields to update.")
+    return _text(await client.request("PUT", f"/Users/{user_id}/", json=payload))
+
+
+async def tool_cyberark_delete_user(args: dict) -> dict:
+    await client.request("DELETE", f"/Users/{args['user_id']}/")
+    return _text(f"User {args['user_id']} deleted.")
+
+
+async def tool_cyberark_activate_user(args: dict) -> dict:
+    await client.request("POST", f"/Users/{args['user_id']}/activate/")
+    return _text(f"User {args['user_id']} activated.")
+
+
+async def tool_cyberark_enable_user(args: dict) -> dict:
+    await client.request("POST", f"/Users/{args['user_id']}/enable/")
+    return _text(f"User {args['user_id']} enabled.")
+
+
+async def tool_cyberark_disable_user(args: dict) -> dict:
+    await client.request("POST", f"/Users/{args['user_id']}/disable/")
+    return _text(f"User {args['user_id']} disabled.")
+
+
+async def tool_cyberark_reset_user_password(args: dict) -> dict:
+    payload = {"id": args["user_id"], "newPassword": args["new_password"]}
+    await client.request("POST", f"/Users/{args['user_id']}/ResetPassword/", json=payload)
+    return _text(f"Password reset for user {args['user_id']}.")
+
+
+# ── Group handlers ───────────────────────────────────────────────────────────
+
+async def tool_cyberark_list_groups(args: dict) -> dict:
+    params: dict[str, Any] = {}
+    if args.get("search"):
+        params["search"] = args["search"]
+    if args.get("filter"):
+        params["filter"] = args["filter"]
+    if args.get("sort"):
+        params["sort"] = args["sort"]
+    if args.get("include_members"):
+        params["includeMembers"] = args["include_members"]
+    return _text(await client.request("GET", "/UserGroups/", params=params or None))
+
+
+async def tool_cyberark_get_group(args: dict) -> dict:
+    params = {}
+    if args.get("include_members"):
+        params["includeMembers"] = True
+    return _text(await client.request("GET", f"/UserGroups/{args['group_id']}/", params=params or None))
+
+
+async def tool_cyberark_create_group(args: dict) -> dict:
+    payload: dict[str, Any] = {"groupName": args["group_name"]}
+    if args.get("description"):
+        payload["description"] = args["description"]
+    if args.get("location"):
+        payload["location"] = args["location"]
+    return _text(await client.request("POST", "/UserGroups/", json=payload))
+
+
+async def tool_cyberark_update_group(args: dict) -> dict:
+    payload = {"groupName": args["group_name"]}
+    return _text(await client.request("PUT", f"/UserGroups/{args['group_id']}/", json=payload))
+
+
+async def tool_cyberark_delete_group(args: dict) -> dict:
+    await client.request("DELETE", f"/UserGroups/{args['group_id']}/")
+    return _text(f"Group {args['group_id']} deleted.")
+
+
+async def tool_cyberark_add_group_member(args: dict) -> dict:
+    payload: dict[str, Any] = {
+        "memberId": args["member_id"],
+        "memberType": args.get("member_type", "vault"),
+    }
+    if args.get("domain_name"):
+        payload["domainName"] = args["domain_name"]
+    return _text(await client.request("POST", f"/UserGroups/{args['group_id']}/Members/", json=payload))
+
+
+async def tool_cyberark_remove_group_member(args: dict) -> dict:
+    await client.request("DELETE", f"/UserGroups/{args['group_id']}/Members/{args['member_name']}/")
+    return _text(f"Member {args['member_name']} removed from group {args['group_id']}.")
+
+
+# ── Live Session handlers ────────────────────────────────────────────────────
+
+async def tool_cyberark_list_live_sessions(args: dict) -> dict:
+    params: dict[str, Any] = {
+        "Limit": args.get("limit", 25),
+        "Offset": args.get("offset", 0),
+    }
+    if args.get("search"):
+        params["Search"] = args["search"]
+    if args.get("safe"):
+        params["Safe"] = args["safe"]
+    if args.get("from_time"):
+        params["FromTime"] = args["from_time"]
+    if args.get("to_time"):
+        params["ToTime"] = args["to_time"]
+    if args.get("sort"):
+        params["Sort"] = args["sort"]
+    return _text(await client.request("GET", "/LiveSessions/", params=params))
+
+
+async def tool_cyberark_get_live_session(args: dict) -> dict:
+    return _text(await client.request("GET", f"/LiveSessions/{args['session_id']}/"))
+
+
+async def tool_cyberark_get_session_activities(args: dict) -> dict:
+    return _text(await client.request("GET", f"/LiveSessions/{args['session_id']}/activities/"))
+
+
+async def tool_cyberark_monitor_session(args: dict) -> dict:
+    return _text(await client.request("GET", f"/LiveSessions/{args['session_id']}/Monitor/"))
+
+
+async def tool_cyberark_suspend_session(args: dict) -> dict:
+    await client.request("POST", f"/LiveSessions/{args['session_id']}/Suspend/")
+    return _text(f"Session {args['session_id']} suspended.")
+
+
+async def tool_cyberark_resume_session(args: dict) -> dict:
+    await client.request("POST", f"/LiveSessions/{args['session_id']}/Resume/")
+    return _text(f"Session {args['session_id']} resumed.")
+
+
+async def tool_cyberark_terminate_session(args: dict) -> dict:
+    await client.request("POST", f"/LiveSessions/{args['session_id']}/Terminate/")
+    return _text(f"Session {args['session_id']} terminated.")
+
+
+# ── Recording handlers ───────────────────────────────────────────────────────
+
+async def tool_cyberark_list_recordings(args: dict) -> dict:
+    params: dict[str, Any] = {
+        "Limit": args.get("limit", 25),
+        "Offset": args.get("offset", 0),
+    }
+    if args.get("search"):
+        params["Search"] = args["search"]
+    if args.get("safe"):
+        params["Safe"] = args["safe"]
+    if args.get("from_time"):
+        params["FromTime"] = args["from_time"]
+    if args.get("to_time"):
+        params["ToTime"] = args["to_time"]
+    if args.get("sort"):
+        params["Sort"] = args["sort"]
+    return _text(await client.request("GET", "/Recordings/", params=params))
+
+
+async def tool_cyberark_get_recording(args: dict) -> dict:
+    return _text(await client.request("GET", f"/Recordings/{args['recording_id']}/"))
+
+
+async def tool_cyberark_get_recording_activities(args: dict) -> dict:
+    return _text(await client.request("GET", f"/Recordings/{args['recording_id']}/activities/"))
+
+
 TOOL_HANDLERS: dict[str, Any] = {
     "cyberark_logon": tool_cyberark_logon,
     "cyberark_logoff": tool_cyberark_logoff,
@@ -968,6 +1522,36 @@ TOOL_HANDLERS: dict[str, Any] = {
     "cyberark_delete_safe": tool_cyberark_delete_safe,
     "cyberark_list_safe_members": tool_cyberark_list_safe_members,
     "cyberark_add_safe_member": tool_cyberark_add_safe_member,
+    # Users
+    "cyberark_list_users": tool_cyberark_list_users,
+    "cyberark_get_user": tool_cyberark_get_user,
+    "cyberark_add_user": tool_cyberark_add_user,
+    "cyberark_update_user": tool_cyberark_update_user,
+    "cyberark_delete_user": tool_cyberark_delete_user,
+    "cyberark_activate_user": tool_cyberark_activate_user,
+    "cyberark_enable_user": tool_cyberark_enable_user,
+    "cyberark_disable_user": tool_cyberark_disable_user,
+    "cyberark_reset_user_password": tool_cyberark_reset_user_password,
+    # Groups
+    "cyberark_list_groups": tool_cyberark_list_groups,
+    "cyberark_get_group": tool_cyberark_get_group,
+    "cyberark_create_group": tool_cyberark_create_group,
+    "cyberark_update_group": tool_cyberark_update_group,
+    "cyberark_delete_group": tool_cyberark_delete_group,
+    "cyberark_add_group_member": tool_cyberark_add_group_member,
+    "cyberark_remove_group_member": tool_cyberark_remove_group_member,
+    # Live Sessions
+    "cyberark_list_live_sessions": tool_cyberark_list_live_sessions,
+    "cyberark_get_live_session": tool_cyberark_get_live_session,
+    "cyberark_get_session_activities": tool_cyberark_get_session_activities,
+    "cyberark_monitor_session": tool_cyberark_monitor_session,
+    "cyberark_suspend_session": tool_cyberark_suspend_session,
+    "cyberark_resume_session": tool_cyberark_resume_session,
+    "cyberark_terminate_session": tool_cyberark_terminate_session,
+    # Recordings
+    "cyberark_list_recordings": tool_cyberark_list_recordings,
+    "cyberark_get_recording": tool_cyberark_get_recording,
+    "cyberark_get_recording_activities": tool_cyberark_get_recording_activities,
 }
 
 # ---------------------------------------------------------------------------
