@@ -798,7 +798,7 @@ TOOLS = [
     },
     {
         "name": "cyberark_get_user",
-        "description": "Get full details of a single Vault user by their numeric user ID.",
+        "description": "Get full details of a single Vault user by their numeric user ID. Call cyberark_list_users first to obtain the numeric ID.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1303,7 +1303,10 @@ async def tool_cyberark_list_users(args: dict) -> dict:
 
 
 async def tool_cyberark_get_user(args: dict) -> dict:
-    return _text(await client.request("GET", f"/Users/{args['user_id']}/"))
+    uid = int(args.get("user_id") or 0)
+    if uid <= 0:
+        return _text("user_id must be a positive integer. Call cyberark_list_users first to obtain valid user IDs.")
+    return _text(await client.request("GET", f"/Users/{uid}/"))
 
 
 async def tool_cyberark_add_user(args: dict) -> dict:
@@ -1331,7 +1334,9 @@ async def tool_cyberark_add_user(args: dict) -> dict:
 
 
 async def tool_cyberark_update_user(args: dict) -> dict:
-    user_id = args["user_id"]
+    user_id = int(args.get("user_id") or 0)
+    if user_id <= 0:
+        return _text("user_id must be a positive integer. Call cyberark_list_users first to obtain valid user IDs.")
     payload: dict[str, Any] = {}
     for src, dst in [
         ("enable_user", "enableUser"),
@@ -1349,30 +1354,59 @@ async def tool_cyberark_update_user(args: dict) -> dict:
     return _text(await client.request("PUT", f"/Users/{user_id}/", json=payload))
 
 
+def _require_user_id(args: dict) -> Optional[int]:
+    uid = int(args.get("user_id") or 0)
+    return uid if uid > 0 else None
+
+
+def _require_group_id(args: dict) -> Optional[int]:
+    gid = int(args.get("group_id") or 0)
+    return gid if gid > 0 else None
+
+
+_USER_ID_HINT = "user_id must be a positive integer. Call cyberark_list_users first to obtain valid user IDs."
+_GROUP_ID_HINT = "group_id must be a positive integer. Call cyberark_list_groups first to obtain valid group IDs."
+
+
 async def tool_cyberark_delete_user(args: dict) -> dict:
-    await client.request("DELETE", f"/Users/{args['user_id']}/")
-    return _text(f"User {args['user_id']} deleted.")
+    uid = _require_user_id(args)
+    if not uid:
+        return _text(_USER_ID_HINT)
+    await client.request("DELETE", f"/Users/{uid}/")
+    return _text(f"User {uid} deleted.")
 
 
 async def tool_cyberark_activate_user(args: dict) -> dict:
-    await client.request("POST", f"/Users/{args['user_id']}/activate/")
-    return _text(f"User {args['user_id']} activated.")
+    uid = _require_user_id(args)
+    if not uid:
+        return _text(_USER_ID_HINT)
+    await client.request("POST", f"/Users/{uid}/activate/")
+    return _text(f"User {uid} activated.")
 
 
 async def tool_cyberark_enable_user(args: dict) -> dict:
-    await client.request("POST", f"/Users/{args['user_id']}/enable/")
-    return _text(f"User {args['user_id']} enabled.")
+    uid = _require_user_id(args)
+    if not uid:
+        return _text(_USER_ID_HINT)
+    await client.request("POST", f"/Users/{uid}/enable/")
+    return _text(f"User {uid} enabled.")
 
 
 async def tool_cyberark_disable_user(args: dict) -> dict:
-    await client.request("POST", f"/Users/{args['user_id']}/disable/")
-    return _text(f"User {args['user_id']} disabled.")
+    uid = _require_user_id(args)
+    if not uid:
+        return _text(_USER_ID_HINT)
+    await client.request("POST", f"/Users/{uid}/disable/")
+    return _text(f"User {uid} disabled.")
 
 
 async def tool_cyberark_reset_user_password(args: dict) -> dict:
-    payload = {"id": args["user_id"], "newPassword": args["new_password"]}
-    await client.request("POST", f"/Users/{args['user_id']}/ResetPassword/", json=payload)
-    return _text(f"Password reset for user {args['user_id']}.")
+    uid = _require_user_id(args)
+    if not uid:
+        return _text(_USER_ID_HINT)
+    payload = {"id": uid, "newPassword": args["new_password"]}
+    await client.request("POST", f"/Users/{uid}/ResetPassword/", json=payload)
+    return _text(f"Password reset for user {uid}.")
 
 
 # ── Group handlers ───────────────────────────────────────────────────────────
@@ -1391,10 +1425,13 @@ async def tool_cyberark_list_groups(args: dict) -> dict:
 
 
 async def tool_cyberark_get_group(args: dict) -> dict:
+    gid = _require_group_id(args)
+    if not gid:
+        return _text(_GROUP_ID_HINT)
     params = {}
     if args.get("include_members"):
         params["includeMembers"] = True
-    return _text(await client.request("GET", f"/UserGroups/{args['group_id']}/", params=params or None))
+    return _text(await client.request("GET", f"/UserGroups/{gid}/", params=params or None))
 
 
 async def tool_cyberark_create_group(args: dict) -> dict:
@@ -1407,28 +1444,40 @@ async def tool_cyberark_create_group(args: dict) -> dict:
 
 
 async def tool_cyberark_update_group(args: dict) -> dict:
+    gid = _require_group_id(args)
+    if not gid:
+        return _text(_GROUP_ID_HINT)
     payload = {"groupName": args["group_name"]}
-    return _text(await client.request("PUT", f"/UserGroups/{args['group_id']}/", json=payload))
+    return _text(await client.request("PUT", f"/UserGroups/{gid}/", json=payload))
 
 
 async def tool_cyberark_delete_group(args: dict) -> dict:
-    await client.request("DELETE", f"/UserGroups/{args['group_id']}/")
-    return _text(f"Group {args['group_id']} deleted.")
+    gid = _require_group_id(args)
+    if not gid:
+        return _text(_GROUP_ID_HINT)
+    await client.request("DELETE", f"/UserGroups/{gid}/")
+    return _text(f"Group {gid} deleted.")
 
 
 async def tool_cyberark_add_group_member(args: dict) -> dict:
+    gid = _require_group_id(args)
+    if not gid:
+        return _text(_GROUP_ID_HINT)
     payload: dict[str, Any] = {
         "memberId": args["member_id"],
         "memberType": args.get("member_type", "vault"),
     }
     if args.get("domain_name"):
         payload["domainName"] = args["domain_name"]
-    return _text(await client.request("POST", f"/UserGroups/{args['group_id']}/Members/", json=payload))
+    return _text(await client.request("POST", f"/UserGroups/{gid}/Members/", json=payload))
 
 
 async def tool_cyberark_remove_group_member(args: dict) -> dict:
-    await client.request("DELETE", f"/UserGroups/{args['group_id']}/Members/{args['member_name']}/")
-    return _text(f"Member {args['member_name']} removed from group {args['group_id']}.")
+    gid = _require_group_id(args)
+    if not gid:
+        return _text(_GROUP_ID_HINT)
+    await client.request("DELETE", f"/UserGroups/{gid}/Members/{args['member_name']}/")
+    return _text(f"Member {args['member_name']} removed from group {gid}.")
 
 
 # ── Live Session handlers ────────────────────────────────────────────────────
