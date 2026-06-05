@@ -216,6 +216,7 @@ async def _auth_ok(authorization: str) -> bool:
 # In-memory stores (reset on restart)
 _registered_clients: dict = {}  # client_id → {client_secret, redirect_uris, ...}
 _auth_codes: dict = {}           # code → {client_id, redirect_uri, code_challenge, scope, exp}
+_idp_sessions: dict = {}         # opaque_refresh_token → {idp_refresh_token, client_id, scope, exp}
 
 
 def _validate_token(authorization: str) -> bool:
@@ -1668,7 +1669,7 @@ async def oauth_authorization_server():
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "jwks_uri": meta.get("jwks_uri", ""),
             "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
-            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
             "response_types_supported": ["code"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "code_challenge_methods_supported": ["S256"],
@@ -1681,7 +1682,7 @@ async def oauth_authorization_server():
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
             "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
-            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
             "response_types_supported": ["code"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "code_challenge_methods_supported": ["S256"],
@@ -1712,7 +1713,7 @@ async def openid_configuration():
             "token_endpoint": f"{OAUTH_ISSUER}/oauth/token",
             "registration_endpoint": f"{OAUTH_ISSUER}/oauth/register",
             "jwks_uri": f"{OAUTH_ISSUER}/.well-known/jwks.json",
-            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
             "response_types_supported": ["code"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "code_challenge_methods_supported": ["S256"],
@@ -1809,10 +1810,48 @@ async def token_endpoint(request: Request):
     if USE_EXTERNAL_IDP:
         if not grant_type:
             return JSONResponse(status_code=400,
-                                content={"error": "invalid_request", "message": "grant_type is required"})
+                                content={"error": "invalid_request", "error_description": "grant_type is required"})
 
         meta = await _get_idp_meta()
         idp_token_url = meta.get("token_endpoint", "")
+
+        # Handle refresh_token grant: look up cached IdP refresh token
+        if grant_type == "refresh_token":
+            our_token = body.get("refresh_token", "")
+            if not our_token:
+                return JSONResponse(status_code=400, content={
+                    "error": "invalid_request",
+                    "error_description": "refresh_token parameter is required",
+                })
+            session = _idp_sessions.get(our_token)
+            if not session or session.get("exp", 0) < int(time.time()):
+                _idp_sessions.pop(our_token, None)
+                return JSONResponse(status_code=400, content={
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token is invalid or expired. Please re-authenticate.",
+                })
+            refresh_form: dict[str, str] = {
+                "grant_type": "refresh_token",
+                "refresh_token": session["idp_refresh_token"],
+                "client_id": IDP_CLIENT_ID,
+            }
+            if IDP_CLIENT_SECRET:
+                refresh_form["client_secret"] = IDP_CLIENT_SECRET
+            logger.info("Proxy refresh_token to IdP for client: %s", session.get("client_id"))
+            async with httpx.AsyncClient() as c:
+                r = await c.post(idp_token_url, data=refresh_form,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+            resp_data = r.json() if r.content else {}
+            if r.status_code == 200:
+                # Rotate IdP refresh token if returned, keep our opaque token stable
+                if resp_data.get("refresh_token"):
+                    session["idp_refresh_token"] = resp_data["refresh_token"]
+                resp_data["refresh_token"] = our_token
+                _idp_sessions[our_token] = session
+            else:
+                _idp_sessions.pop(our_token, None)
+            logger.info("IdP refresh response: %s %s", r.status_code, resp_data.get("error", "ok"))
+            return JSONResponse(status_code=r.status_code, content=resp_data)
 
         # Build clean form_data — send only what the IdP requires
         form_data: dict[str, str] = {
@@ -1830,12 +1869,31 @@ async def token_endpoint(request: Request):
                 form_data["code_verifier"] = body.get("code_verifier")
         elif grant_type == "client_credentials":
             form_data["scope"] = IDP_SCOPE
+        else:
+            return JSONResponse(status_code=400, content={
+                "error": "unsupported_grant_type",
+                "error_description": f"grant_type '{grant_type}' is not supported",
+            })
 
         logger.info("Proxy token to IdP: %s (grant_type=%s)", idp_token_url, grant_type)
         async with httpx.AsyncClient() as c:
             r = await c.post(idp_token_url, data=form_data,
                              headers={"Content-Type": "application/x-www-form-urlencoded"})
         resp_data = r.json() if r.content else {}
+
+        # Cache IdP refresh_token and issue our own opaque one
+        if r.status_code == 200 and resp_data.get("refresh_token"):
+            idp_refresh = resp_data["refresh_token"]
+            our_refresh = secrets.token_urlsafe(32)
+            _idp_sessions[our_refresh] = {
+                "idp_refresh_token": idp_refresh,
+                "client_id": body.get("client_id", IDP_CLIENT_ID),
+                "scope": resp_data.get("scope", IDP_SCOPE),
+                "exp": int(time.time()) + 86400 * 30,
+            }
+            resp_data["refresh_token"] = our_refresh
+            logger.info("IdP refresh_token cached, opaque token issued")
+
         logger.info("IdP token response: %s %s", r.status_code, resp_data.get("error", "ok"))
         return JSONResponse(status_code=r.status_code, content=resp_data)
 
