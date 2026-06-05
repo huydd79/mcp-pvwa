@@ -185,23 +185,29 @@ async def _validate_idp_token(token: str) -> bool:
             logger.warning("No JWKS key matched kid=%s", kid)
             return False
 
-        decode_kwargs: dict = {"algorithms": [alg]}
-        decode_options: dict = {}
-        if IDP_ISSUER:
-            decode_kwargs["issuer"] = IDP_ISSUER.rstrip("/")
-        else:
-            decode_options["verify_iss"] = False
+        # Decode with signature+expiry verification only; check iss/aud manually
+        # to handle IdPs that include a trailing slash in the iss claim (e.g. CyberArk Identity).
+        decode_kwargs: dict = {
+            "algorithms": [alg],
+            "options": {"verify_iss": False, "verify_aud": False},
+        }
         if IDP_AUDIENCE:
             decode_kwargs["audience"] = IDP_AUDIENCE
-        else:
-            decode_options["verify_aud"] = False
-        if decode_options:
-            decode_kwargs["options"] = decode_options
+            decode_kwargs["options"].pop("verify_aud")  # let PyJWT check aud when provided
 
         for key_data in matched:
             try:
                 public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
-                pyjwt.decode(token, public_key, **decode_kwargs)
+                claims = pyjwt.decode(token, public_key, **decode_kwargs)
+
+                # Manual iss check: normalize trailing slash on both sides
+                if IDP_ISSUER:
+                    token_iss = claims.get("iss", "").rstrip("/")
+                    if token_iss != IDP_ISSUER.rstrip("/"):
+                        logger.warning("IdP token iss mismatch: got '%s', expected '%s'",
+                                       claims.get("iss"), IDP_ISSUER)
+                        return False
+
                 logger.info("IdP token validated OK (kid=%s)", kid)
                 return True
             except pyjwt.ExpiredSignatureError:
