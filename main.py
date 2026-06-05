@@ -185,29 +185,24 @@ async def _validate_idp_token(token: str) -> bool:
             logger.warning("No JWKS key matched kid=%s", kid)
             return False
 
-        # Decode with signature+expiry verification only; check iss/aud manually
-        # to handle IdPs that include a trailing slash in the iss claim (e.g. CyberArk Identity).
-        decode_kwargs: dict = {
-            "algorithms": [alg],
-            "options": {"verify_iss": False, "verify_aud": False},
-        }
+        # Pass issuer as a two-element list (with and without trailing slash) so PyJWT
+        # accepts tokens from CyberArk Identity regardless of how the iss claim is formatted.
+        # This is more reliable than options={"verify_iss": False} whose behaviour changed
+        # across PyJWT minor versions (e.g. 2.9 vs 2.13).
+        decode_kwargs: dict = {"algorithms": [alg], "options": {"verify_aud": False}}
+        if IDP_ISSUER:
+            base = IDP_ISSUER.rstrip("/")
+            decode_kwargs["issuer"] = [base, base + "/"]
+        else:
+            decode_kwargs["options"]["verify_iss"] = False
         if IDP_AUDIENCE:
             decode_kwargs["audience"] = IDP_AUDIENCE
-            decode_kwargs["options"].pop("verify_aud")  # let PyJWT check aud when provided
+            decode_kwargs["options"].pop("verify_aud", None)
 
         for key_data in matched:
             try:
                 public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
-                claims = pyjwt.decode(token, public_key, **decode_kwargs)
-
-                # Manual iss check: normalize trailing slash on both sides
-                if IDP_ISSUER:
-                    token_iss = claims.get("iss", "").rstrip("/")
-                    if token_iss != IDP_ISSUER.rstrip("/"):
-                        logger.warning("IdP token iss mismatch: got '%s', expected '%s'",
-                                       claims.get("iss"), IDP_ISSUER)
-                        return False
-
+                pyjwt.decode(token, public_key, **decode_kwargs)
                 logger.info("IdP token validated OK (kid=%s)", kid)
                 return True
             except pyjwt.ExpiredSignatureError:
