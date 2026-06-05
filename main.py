@@ -1604,6 +1604,114 @@ TOOL_HANDLERS: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+PROMPTS = [
+    {
+        "name": "system_status",
+        "description": "Show a full health status report for all CyberArk PAM components (PVWA, CPM, PSM, AIM, PTA) with connection counts, versions, and any issues.",
+        "arguments": [],
+    },
+    {
+        "name": "safe_list",
+        "description": "List all CyberArk Safes accessible to the current user.",
+        "arguments": [
+            {"name": "search", "description": "Filter safes by name (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "account_list",
+        "description": "List CyberArk accounts/credentials with platform, safe, and username details.",
+        "arguments": [
+            {"name": "search", "description": "Free-text search filter (optional).", "required": False},
+            {"name": "safe", "description": "Filter by Safe name (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "user_list",
+        "description": "List all Vault users with username, type, and enabled/suspended status.",
+        "arguments": [
+            {"name": "search", "description": "Filter by username or description (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "group_list",
+        "description": "List all Vault groups.",
+        "arguments": [
+            {"name": "search", "description": "Filter by group name (optional).", "required": False},
+        ],
+    },
+    {
+        "name": "session_list",
+        "description": "List active PSM/PSMP privileged sessions showing user, target account, and start time.",
+        "arguments": [],
+    },
+    {
+        "name": "highlight_alerts",
+        "description": "Analyze the CyberArk PAM environment and highlight any alerts, disconnected components, offline AIM providers, or other issues requiring attention.",
+        "arguments": [],
+    },
+]
+
+PROMPT_MESSAGES: dict[str, str] = {
+    "system_status": (
+        "Use cyberark_get_health_summary and cyberark_get_health_details for each component "
+        "(PVWA, CPM, SessionManagement, AIM) in parallel. "
+        "Present the results as a clear status table showing: component name, connected/total count, "
+        "version, last logon, and overall status (OK / WARNING / ERROR). "
+        "Highlight any component that is offline or has count < total."
+    ),
+    "safe_list": (
+        "Use cyberark_list_safes{search_clause} to retrieve the Safe list. "
+        "Display results in a table with columns: Safe Name, number of members (if available). "
+        "Show total count at the end."
+    ),
+    "account_list": (
+        "Use cyberark_list_accounts{search_clause}{safe_clause} to retrieve accounts. "
+        "Display results in a table with columns: Account Name, Username, Platform, Safe. "
+        "Show total count at the end."
+    ),
+    "user_list": (
+        "Use cyberark_list_users{search_clause} to retrieve Vault users. "
+        "Display results in a table with columns: Username, Type, Source, Status (Enabled/Disabled/Suspended). "
+        "Show total count at the end."
+    ),
+    "group_list": (
+        "Use cyberark_list_groups{search_clause} to retrieve Vault groups. "
+        "Display results in a table with columns: Group Name, Type, Directory. "
+        "Show total count at the end."
+    ),
+    "session_list": (
+        "Use cyberark_list_live_sessions to retrieve active privileged sessions. "
+        "Display results in a table with columns: Session ID, User, Target Account, Target Address, "
+        "Protocol, Start Time, Duration. "
+        "If no active sessions, state that clearly. Show total count."
+    ),
+    "highlight_alerts": (
+        "Perform a full health check: call cyberark_get_health_summary and "
+        "cyberark_get_health_details for PVWA, CPM, SessionManagement, and AIM. "
+        "Then analyze the results and produce a prioritized alert summary: "
+        "- CRITICAL: components where connected count = 0 "
+        "- WARNING: components where connected < total, or version mismatch "
+        "- INFO: components fully healthy "
+        "Finish with a one-line overall health verdict."
+    ),
+}
+
+
+def _build_prompt_messages(name: str, arguments: dict) -> list[dict]:
+    template = PROMPT_MESSAGES.get(name, "")
+    search = arguments.get("search", "")
+    safe = arguments.get("safe", "")
+    text = template.format(
+        search_clause=f" with search='{search}'" if search else "",
+        safe_clause=f" filtered to safe='{safe}'" if safe else "",
+    )
+    return [{"role": "user", "content": {"type": "text", "text": text}}]
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -2024,7 +2132,25 @@ async def mcp_endpoint(payload: dict, request: Request):
         return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}})
 
     if method == "prompts/list":
-        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}})
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"prompts": PROMPTS}})
+
+    if method == "prompts/get":
+        params = payload.get("params", {})
+        prompt_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        prompt = next((p for p in PROMPTS if p["name"] == prompt_name), None)
+        if not prompt:
+            return JSONResponse(content={
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32602, "message": f"Prompt '{prompt_name}' not found"},
+            })
+        return JSONResponse(content={
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "description": prompt["description"],
+                "messages": _build_prompt_messages(prompt_name, arguments),
+            },
+        })
 
     if method == "tools/call":
         params = payload.get("params", {})
