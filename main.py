@@ -31,7 +31,7 @@ import os
 import re
 import json
 import hmac
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 import base64
 import hashlib
 import secrets
@@ -104,6 +104,28 @@ _JWKS_TTL = 3600
 # Per-request bearer token (set in MCP endpoint, read in PVWAClient for SAML)
 _bearer_ctx: ContextVar[str] = ContextVar("bearer", default="")
 
+# Per-bearer PVWA session store — isolates tokens across concurrent users.
+# Key: truncated SHA-256 of bearer token (or "_" when auth disabled).
+# Value: {token: str, saml: bool, at: int}
+_pvwa_sessions: dict[str, dict] = {}
+_pvwa_locks: dict[str, asyncio.Lock] = {}
+
+
+def _bearer_key() -> str:
+    b = _bearer_ctx.get()
+    return hashlib.sha256(b.encode()).hexdigest()[:16] if b else "_"
+
+
+def _get_pvwa_lock(key: str) -> asyncio.Lock:
+    if key not in _pvwa_locks:
+        _pvwa_locks[key] = asyncio.Lock()
+    return _pvwa_locks[key]
+
+
+# Shared HTTP client for IdP calls — reuses connection pool across all requests.
+# Initialized at startup; None only before app startup (e.g. unit tests).
+_idp_http: Optional[httpx.AsyncClient] = None
+
 _KID = str(uuid.uuid4())[:8]
 
 _pem_env = os.environ.get("OAUTH_PRIVATE_KEY_PEM", "")
@@ -127,11 +149,12 @@ def _jwks() -> dict:
     return {"keys": [{"kty": "RSA", "use": "sig", "kid": _KID, "alg": "RS256", "n": _b64url(nums.n), "e": _b64url(nums.e)}]}
 
 
-def _issue_token(client_id: str, scope: str = "mcp:read mcp:write") -> str:
+async def _issue_token(client_id: str, scope: str = "mcp:read mcp:write") -> str:
     now = int(time.time())
     payload = {"iss": OAUTH_ISSUER, "sub": client_id, "aud": OAUTH_ISSUER,
                "iat": now, "exp": now + OAUTH_TOKEN_EXPIRY, "jti": str(uuid.uuid4()), "scope": scope}
-    return pyjwt.encode(payload, _private_pem, algorithm="RS256", headers={"kid": _KID})
+    # RSA-2048 signing is CPU-bound; offload to thread pool to avoid blocking the event loop.
+    return await asyncio.to_thread(pyjwt.encode, payload, _private_pem, algorithm="RS256", headers={"kid": _KID})
 
 
 async def _get_idp_meta() -> dict:
@@ -139,10 +162,10 @@ async def _get_idp_meta() -> dict:
     if _idp_meta:
         return _idp_meta
     discovery = IDP_DISCOVERY_URL or f"{IDP_ISSUER}/.well-known/openid-configuration"
-    async with httpx.AsyncClient() as c:
-        r = await c.get(discovery, follow_redirects=True)
-        r.raise_for_status()
-        _idp_meta = r.json()
+    c = _idp_http or httpx.AsyncClient()
+    r = await c.get(discovery, follow_redirects=True)
+    r.raise_for_status()
+    _idp_meta = r.json()
     logger.info("IdP metadata loaded from %s", discovery)
     return _idp_meta
 
@@ -154,10 +177,10 @@ async def _get_idp_jwks() -> list:
         return _idp_jwks_cache["keys"]
     meta = await _get_idp_meta()
     jwks_uri = meta.get("jwks_uri", "")
-    async with httpx.AsyncClient() as c:
-        r = await c.get(jwks_uri)
-        r.raise_for_status()
-        data = r.json()
+    c = _idp_http or httpx.AsyncClient()
+    r = await c.get(jwks_uri)
+    r.raise_for_status()
+    data = r.json()
     _idp_jwks_cache = {"keys": data.get("keys", []), "at": now}
     logger.info("IdP JWKS refreshed (%d keys)", len(_idp_jwks_cache["keys"]))
     return _idp_jwks_cache["keys"]
@@ -260,9 +283,10 @@ def _parse_saml_response_from_html(html: str) -> Optional[str]:
       <form ...><input type="hidden" name="SAMLResponse" value="<base64>"/></form>
     Handles both attribute orderings (name before value, value before name).
     """
+    # Use [^"\']+ (no quotes in base64) to avoid catastrophic backtracking on large HTML.
     patterns = [
-        r'name=["\']SAMLResponse["\'][^>]+value=["\']([A-Za-z0-9+/=\s]+)["\']',
-        r'value=["\']([A-Za-z0-9+/=\s]+)["\'][^>]+name=["\']SAMLResponse["\']',
+        r'name=["\']SAMLResponse["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']SAMLResponse["\']',
     ]
     for pat in patterns:
         m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
@@ -284,9 +308,32 @@ class PVWAClient:
     """
 
     def __init__(self) -> None:
-        self._token: Optional[str] = None
-        self._saml_session: bool = False  # True when logged in via SAML
         self._client = httpx.AsyncClient(verify=VERIFY_SSL, timeout=30)
+
+    # _token and _saml_session are backed by _pvwa_sessions keyed on bearer hash
+    # so concurrent requests from different users never share a PVWA session.
+
+    @property
+    def _token(self) -> Optional[str]:
+        return _pvwa_sessions.get(_bearer_key(), {}).get("token")
+
+    @_token.setter
+    def _token(self, value: Optional[str]) -> None:
+        key = _bearer_key()
+        entry = _pvwa_sessions.setdefault(key, {})
+        if value is None:
+            entry.pop("token", None)
+        else:
+            entry["token"] = value
+            entry["at"] = int(time.time())
+
+    @property
+    def _saml_session(self) -> bool:
+        return _pvwa_sessions.get(_bearer_key(), {}).get("saml", False)
+
+    @_saml_session.setter
+    def _saml_session(self, value: bool) -> None:
+        _pvwa_sessions.setdefault(_bearer_key(), {})["saml"] = value
 
     # ------------------------------------------------------------------
     # SAML helpers
@@ -322,8 +369,8 @@ class PVWAClient:
         NS = "urn:oasis:names:tc:SAML:2.0:metadata"
         for meta_url in metadata_candidates:
             try:
-                async with httpx.AsyncClient(timeout=10) as c:
-                    r = await c.get(meta_url, follow_redirects=True)
+                c = _idp_http or httpx.AsyncClient(timeout=10)
+                r = await c.get(meta_url, follow_redirects=True)
                 if r.status_code != 200:
                     continue
                 root = ET.fromstring(r.text)
@@ -355,8 +402,7 @@ class PVWAClient:
         """
         try:
             pvwa_init = f"{PVWA_URL}/PasswordVault/v10/Logon/SAML"
-            async with httpx.AsyncClient(verify=VERIFY_SSL, timeout=10) as c:
-                r = await c.get(pvwa_init, follow_redirects=False)
+            r = await self._client.get(pvwa_init, follow_redirects=False)
 
             if r.status_code not in (301, 302):
                 logger.debug("SP-initiated: PVWA init returned %s (expected redirect)", r.status_code)
@@ -369,12 +415,12 @@ class PVWAClient:
 
             logger.info("SP-initiated: PVWA → IdP SSO: %.100s", idp_sso_url)
 
-            async with httpx.AsyncClient(timeout=15) as c:
-                r2 = await c.get(
-                    idp_sso_url,
-                    headers={"Authorization": f"Bearer {bearer_token}"},
-                    follow_redirects=True,
-                )
+            c = _idp_http or httpx.AsyncClient(timeout=15)
+            r2 = await c.get(
+                idp_sso_url,
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                follow_redirects=True,
+            )
 
             if r2.status_code != 200:
                 logger.warning("SP-initiated: IdP SSO returned %s", r2.status_code)
@@ -426,12 +472,12 @@ class PVWAClient:
         for url in candidates:
             try:
                 logger.info("IdP-initiated: trying %s", url)
-                async with httpx.AsyncClient(timeout=15) as c:
-                    r = await c.get(
-                        url,
-                        headers={"Authorization": f"Bearer {bearer_token}"},
-                        follow_redirects=True,
-                    )
+                c = _idp_http or httpx.AsyncClient(timeout=15)
+                r = await c.get(
+                    url,
+                    headers={"Authorization": f"Bearer {bearer_token}"},
+                    follow_redirects=True,
+                )
                 if r.status_code == 200:
                     saml = _parse_saml_response_from_html(r.text)
                     if saml:
@@ -542,16 +588,23 @@ class PVWAClient:
         return {"Authorization": self._token or "", "Content-Type": "application/json"}
 
     async def request(self, method: str, path: str, *, params: Optional[dict] = None, json: Optional[Any] = None) -> Any:
+        key = _bearer_key()
         if not self._token:
-            await self._logon()
+            async with _get_pvwa_lock(key):
+                if not self._token:
+                    await self._logon()
 
         url = f"{BASE_API}{path}"
         resp = await self._client.request(method, url, headers=self._auth_headers(), params=params, json=json)
 
         if resp.status_code == 401:
             logger.info("Session expired — re-authenticating.")
-            self._token = None
-            await self._logon()
+            old_token = self._token
+            async with _get_pvwa_lock(key):
+                # Only re-logon if another concurrent request hasn't already refreshed the token.
+                if self._token == old_token:
+                    self._token = None
+                    await self._logon()
             resp = await self._client.request(method, url, headers=self._auth_headers(), params=params, json=json)
 
         resp.raise_for_status()
@@ -1783,6 +1836,46 @@ app.add_middleware(
 )
 
 
+async def _session_cleanup_loop() -> None:
+    """Periodically evict expired entries from in-memory session stores to prevent OOM."""
+    while True:
+        await asyncio.sleep(300)
+        now = int(time.time())
+        for store in (_auth_codes, _idp_sessions):
+            for k in list(store):
+                if store[k].get("exp", 0) < now:
+                    store.pop(k, None)
+        cutoff_mcp = now - 86400
+        for k in list(_mcp_sessions):
+            if _mcp_sessions[k].get("created", 0) < cutoff_mcp:
+                _mcp_sessions.pop(k, None)
+        cutoff_pvwa = now - 86400
+        for k in list(_pvwa_sessions):
+            if _pvwa_sessions[k].get("at", now) < cutoff_pvwa:
+                _pvwa_sessions.pop(k, None)
+        for k in list(_pvwa_locks):
+            if k not in _pvwa_sessions:
+                _pvwa_locks.pop(k, None)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _idp_http
+    _idp_http = httpx.AsyncClient(timeout=15)
+    asyncio.create_task(_session_cleanup_loop())
+    logger.info("Startup complete — IdP HTTP client ready.")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _idp_http
+    if _idp_http:
+        await _idp_http.aclose()
+        _idp_http = None
+    await client._client.aclose()
+    logger.info("Shutdown complete.")
+
+
 @app.get("/")
 async def health_check():
     return {"status": "online", "message": "CyberArk PVWA MCP Server is running"}
@@ -2005,9 +2098,9 @@ async def token_endpoint(request: Request):
             if IDP_CLIENT_SECRET:
                 refresh_form["client_secret"] = IDP_CLIENT_SECRET
             logger.info("Proxy refresh_token to IdP for client: %s", session.get("client_id"))
-            async with httpx.AsyncClient() as c:
-                r = await c.post(idp_token_url, data=refresh_form,
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+            c = _idp_http or httpx.AsyncClient()
+            r = await c.post(idp_token_url, data=refresh_form,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
             resp_data = r.json() if r.content else {}
             if r.status_code == 200:
                 # Rotate IdP refresh token if returned, keep our opaque token stable
@@ -2043,9 +2136,9 @@ async def token_endpoint(request: Request):
             })
 
         logger.info("Proxy token to IdP: %s (grant_type=%s)", idp_token_url, grant_type)
-        async with httpx.AsyncClient() as c:
-            r = await c.post(idp_token_url, data=form_data,
-                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        c = _idp_http or httpx.AsyncClient()
+        r = await c.post(idp_token_url, data=form_data,
+                         headers={"Content-Type": "application/x-www-form-urlencoded"})
         resp_data = r.json() if r.content else {}
 
         # Cache IdP refresh_token and issue our own opaque one
@@ -2099,7 +2192,7 @@ async def token_endpoint(request: Request):
                 return JSONResponse(status_code=400, content={"error": "invalid_grant", "message": "PKCE verification failed"})
 
         scope = code_data.get("scope", "mcp:read mcp:write")
-        token = _issue_token(client_id, scope)
+        token = await _issue_token(client_id, scope)
         logger.info("Token issued (authorization_code) for client: %s", client_id)
         return JSONResponse(content={
             "access_token": token,
@@ -2124,7 +2217,7 @@ async def token_endpoint(request: Request):
             return JSONResponse(status_code=401, content={"error": "invalid_client"})
 
         scope = body.get("scope", "mcp:read mcp:write")
-        token = _issue_token(client_id, scope)
+        token = await _issue_token(client_id, scope)
         logger.info("Token issued (client_credentials) for client: %s", client_id)
         return JSONResponse(content={
             "access_token": token,
