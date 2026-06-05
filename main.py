@@ -555,6 +555,9 @@ TOOLS = [
             "OPTIONAL — Do NOT call this before other tools. "
             "All CyberArk tools authenticate automatically (via SAML or env-var credentials) "
             "before executing; you do not need to log in first. "
+            "If the user asks to log in or you need to verify credentials, "
+            "first call cyberark_get_logged_on_user to check if a session is already active; "
+            "only proceed with this tool if that returns an error or shows no active session. "
             "Only call this tool explicitly when the user specifically asks to log in, "
             "or to authenticate as a different user with custom credentials. "
             "Authentication priority used by all tools: "
@@ -586,6 +589,16 @@ TOOLS = [
     {
         "name": "cyberark_logoff",
         "description": "OPTIONAL — Do NOT call this after other tools. The server manages session lifecycle automatically. Only call explicitly when the user specifically asks to log out.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cyberark_get_logged_on_user",
+        "description": (
+            "Returns details about the currently authenticated PVWA user (whoami). "
+            "Call this first to verify whether a PVWA session is already active "
+            "before asking the user for credentials or calling cyberark_logon. "
+            "If this returns user details, the session is valid and no logon is needed."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     # ── System Health ───────────────────────────────────────────────────────
@@ -1134,6 +1147,15 @@ async def tool_cyberark_logoff(args: dict) -> dict:
     return _text("PVWA session terminated.")
 
 
+async def tool_cyberark_get_logged_on_user(args: dict) -> dict:
+    if not client._token:
+        await client._logon()
+    url = f"{PVWA_URL}/PasswordVault/WebServices/PIMServices.svc/User"
+    resp = await client._client.get(url, headers=client._auth_headers())
+    resp.raise_for_status()
+    return _text(resp.json() if resp.content else {"status": "ok"})
+
+
 async def tool_cyberark_get_health_summary(args: dict) -> dict:
     return _text(await client.request("GET", "/ComponentsMonitoringSummary/"))
 
@@ -1559,6 +1581,7 @@ async def tool_cyberark_get_recording_activities(args: dict) -> dict:
 TOOL_HANDLERS: dict[str, Any] = {
     "cyberark_logon": tool_cyberark_logon,
     "cyberark_logoff": tool_cyberark_logoff,
+    "cyberark_get_logged_on_user": tool_cyberark_get_logged_on_user,
     "cyberark_get_health_summary": tool_cyberark_get_health_summary,
     "cyberark_get_health_details": tool_cyberark_get_health_details,
     "cyberark_list_accounts": tool_cyberark_list_accounts,
