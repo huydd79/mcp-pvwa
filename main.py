@@ -30,6 +30,7 @@ External IdP (overrides internal OAuth when set):
 import os
 import re
 import json
+import hmac
 import xml.etree.ElementTree as ET
 import base64
 import hashlib
@@ -80,6 +81,11 @@ OAUTH_ISSUER = os.environ.get("OAUTH_ISSUER", "http://localhost:8000").rstrip("/
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "mcp-client")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 OAUTH_TOKEN_EXPIRY = int(os.environ.get("OAUTH_TOKEN_EXPIRY", "3600"))
+
+# Comma-separated list of allowed CORS origins, e.g. "http://localhost:3000,https://app.example.com"
+# Leave empty to disallow cross-origin requests entirely (safest default).
+_cors_raw = os.environ.get("CORS_ORIGINS", "")
+CORS_ORIGINS: list[str] = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 # External IdP (Okta / CyberArk Identity)
 IDP_ISSUER = os.environ.get("IDP_ISSUER", "").rstrip("/")
@@ -179,12 +185,23 @@ async def _validate_idp_token(token: str) -> bool:
             logger.warning("No JWKS key matched kid=%s", kid)
             return False
 
+        decode_kwargs: dict = {"algorithms": [alg]}
+        decode_options: dict = {}
+        if IDP_ISSUER:
+            decode_kwargs["issuer"] = IDP_ISSUER.rstrip("/")
+        else:
+            decode_options["verify_iss"] = False
+        if IDP_AUDIENCE:
+            decode_kwargs["audience"] = IDP_AUDIENCE
+        else:
+            decode_options["verify_aud"] = False
+        if decode_options:
+            decode_kwargs["options"] = decode_options
+
         for key_data in matched:
             try:
                 public_key = RSAAlgorithm.from_jwk(json.dumps(key_data))
-                # Verify signature + expiry only; skip iss/aud (managed by IdP)
-                options = {"verify_aud": False, "verify_iss": False}
-                pyjwt.decode(token, public_key, algorithms=[alg], options=options)
+                pyjwt.decode(token, public_key, **decode_kwargs)
                 logger.info("IdP token validated OK (kid=%s)", kid)
                 return True
             except pyjwt.ExpiredSignatureError:
@@ -545,6 +562,9 @@ client = PVWAClient()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_VALID_HEALTH_COMPONENTS = frozenset({"PVWA", "SessionManagement", "CPM", "PSM", "AIM"})
+
 
 def _text(data: Any) -> dict:
     """Wrap a result value into the MCP content array format."""
@@ -1172,6 +1192,8 @@ async def tool_cyberark_get_health_details(args: dict) -> dict:
     cid = args.get("component_id", "").strip()
     if not cid:
         return _text("component_id is required. Valid values: PVWA, SessionManagement, CPM, PSM, AIM")
+    if cid not in _VALID_HEALTH_COMPONENTS:
+        return _text(f"Invalid component_id '{cid}'. Valid values: {', '.join(sorted(_VALID_HEALTH_COMPONENTS))}")
     return _text(await client.request("GET", f"/ComponentsMonitoringDetails/{cid}"))
 
 
@@ -1509,8 +1531,10 @@ async def tool_cyberark_remove_group_member(args: dict) -> dict:
     gid = _require_group_id(args)
     if not gid:
         return _text(_GROUP_ID_HINT)
-    await client.request("DELETE", f"/UserGroups/{gid}/Members/{args['member_name']}/")
-    return _text(f"Member {args['member_name']} removed from group {gid}.")
+    raw_name = args["member_name"]
+    encoded_name = urllib.parse.quote(raw_name, safe="")
+    await client.request("DELETE", f"/UserGroups/{gid}/Members/{encoded_name}/")
+    return _text(f"Member {raw_name} removed from group {gid}.")
 
 
 # ── Live Session handlers ────────────────────────────────────────────────────
@@ -1751,10 +1775,10 @@ app = FastAPI(title="CyberArk PVWA MCP Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS else ["*"],
+    allow_credentials=bool(CORS_ORIGINS),  # credentials only allowed with explicit origins
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Mcp-Session-Id"],
 )
 
 
@@ -2085,9 +2109,15 @@ async def token_endpoint(request: Request):
 
     # ── Client Credentials ─────────────────────────────────────────────────
     if grant_type == "client_credentials":
-        is_static = (client_id == OAUTH_CLIENT_ID and client_secret == OAUTH_CLIENT_SECRET)
+        is_static = (
+            client_id == OAUTH_CLIENT_ID and
+            bool(OAUTH_CLIENT_SECRET) and
+            hmac.compare_digest(client_secret, OAUTH_CLIENT_SECRET)
+        )
         registered = _registered_clients.get(client_id)
-        is_registered = registered and registered["client_secret"] == client_secret
+        is_registered = bool(
+            registered and hmac.compare_digest(client_secret, registered["client_secret"])
+        )
 
         if not is_static and not is_registered:
             return JSONResponse(status_code=401, content={"error": "invalid_client"})
