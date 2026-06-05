@@ -100,6 +100,12 @@ USE_EXTERNAL_IDP = bool(IDP_ISSUER or IDP_DISCOVERY_URL)
 _idp_meta: dict = {}
 _idp_jwks_cache: dict = {"keys": [], "at": 0}
 _JWKS_TTL = 3600
+_idp_meta_lock = asyncio.Lock()
+_idp_jwks_lock = asyncio.Lock()
+# Allowlist of JWT signing algorithms accepted from external IdP tokens.
+# Prevents algorithm confusion attacks (e.g. "alg":"none" or HS256 with public key).
+_ALLOWED_ALGS = frozenset({"RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
+                            "ES256", "ES384", "ES512"})
 
 # Per-request bearer token (set in MCP endpoint, read in PVWAClient for SAML)
 _bearer_ctx: ContextVar[str] = ContextVar("bearer", default="")
@@ -161,12 +167,15 @@ async def _get_idp_meta() -> dict:
     global _idp_meta
     if _idp_meta:
         return _idp_meta
-    discovery = IDP_DISCOVERY_URL or f"{IDP_ISSUER}/.well-known/openid-configuration"
-    c = _idp_http or httpx.AsyncClient()
-    r = await c.get(discovery, follow_redirects=True)
-    r.raise_for_status()
-    _idp_meta = r.json()
-    logger.info("IdP metadata loaded from %s", discovery)
+    async with _idp_meta_lock:
+        if _idp_meta:  # double-check under lock
+            return _idp_meta
+        discovery = IDP_DISCOVERY_URL or f"{IDP_ISSUER}/.well-known/openid-configuration"
+        c = _idp_http or httpx.AsyncClient()
+        r = await c.get(discovery, follow_redirects=True)
+        r.raise_for_status()
+        _idp_meta = r.json()
+        logger.info("IdP metadata loaded from %s", discovery)
     return _idp_meta
 
 
@@ -175,14 +184,17 @@ async def _get_idp_jwks() -> list:
     now = time.time()
     if _idp_jwks_cache["keys"] and now - _idp_jwks_cache["at"] < _JWKS_TTL:
         return _idp_jwks_cache["keys"]
-    meta = await _get_idp_meta()
-    jwks_uri = meta.get("jwks_uri", "")
-    c = _idp_http or httpx.AsyncClient()
-    r = await c.get(jwks_uri)
-    r.raise_for_status()
-    data = r.json()
-    _idp_jwks_cache = {"keys": data.get("keys", []), "at": now}
-    logger.info("IdP JWKS refreshed (%d keys)", len(_idp_jwks_cache["keys"]))
+    async with _idp_jwks_lock:
+        if _idp_jwks_cache["keys"] and now - _idp_jwks_cache["at"] < _JWKS_TTL:  # double-check
+            return _idp_jwks_cache["keys"]
+        meta = await _get_idp_meta()
+        jwks_uri = meta.get("jwks_uri", "")
+        c = _idp_http or httpx.AsyncClient()
+        r = await c.get(jwks_uri)
+        r.raise_for_status()
+        data = r.json()
+        _idp_jwks_cache = {"keys": data.get("keys", []), "at": now}
+        logger.info("IdP JWKS refreshed (%d keys)", len(_idp_jwks_cache["keys"]))
     return _idp_jwks_cache["keys"]
 
 
@@ -202,6 +214,9 @@ async def _validate_idp_token(token: str) -> bool:
         header = pyjwt.get_unverified_header(token)
         kid = header.get("kid")
         alg = header.get("alg", "RS256")
+        if alg not in _ALLOWED_ALGS:
+            logger.warning("Rejected token: unsupported alg=%s (not in allowlist)", alg)
+            return False
         matched = [k for k in keys if k.get("kid") == kid] if kid else keys
 
         if not matched:
@@ -1845,6 +1860,10 @@ async def _session_cleanup_loop() -> None:
             for k in list(store):
                 if store[k].get("exp", 0) < now:
                     store.pop(k, None)
+        cutoff_clients = now - 86400 * 30
+        for k in list(_registered_clients):
+            if _registered_clients[k].get("registered_at", now) < cutoff_clients:
+                _registered_clients.pop(k, None)
         cutoff_mcp = now - 86400
         for k in list(_mcp_sessions):
             if _mcp_sessions[k].get("created", 0) < cutoff_mcp:
@@ -1990,9 +2009,17 @@ async def openid_configuration():
     })
 
 
+_MAX_REGISTERED_CLIENTS = 200
+
+
 @app.post("/oauth/register")
 async def register_client(request: Request):
     """Dynamic Client Registration — RFC 7591."""
+    if len(_registered_clients) >= _MAX_REGISTERED_CLIENTS:
+        return JSONResponse(status_code=429, content={
+            "error": "too_many_registrations",
+            "error_description": "Registration limit reached. Contact the server administrator.",
+        })
     body = await request.json()
     client_id = str(uuid.uuid4())
     client_secret = secrets.token_urlsafe(32)
@@ -2003,6 +2030,7 @@ async def register_client(request: Request):
         "grant_types": body.get("grant_types", ["authorization_code"]),
         "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_basic"),
         "scope": body.get("scope", "mcp:read mcp:write"),
+        "registered_at": int(time.time()),
     }
     logger.info("Client registered: %s (%s)", client_id, body.get("client_name", ""))
     return JSONResponse(status_code=201, content={
@@ -2161,7 +2189,11 @@ async def token_endpoint(request: Request):
     # Extract client credentials (Basic auth or form params)
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Basic "):
-        decoded = base64.b64decode(auth_header[6:] + "==").decode(errors="replace")
+        try:
+            decoded = base64.b64decode(auth_header[6:] + "==").decode(errors="replace")
+        except Exception:
+            return JSONResponse(status_code=401, content={"error": "invalid_client",
+                                                          "error_description": "Malformed Basic auth header"})
         client_id, _, client_secret = decoded.partition(":")
     else:
         client_id = body.get("client_id", "")
