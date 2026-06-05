@@ -24,6 +24,7 @@ env/
 # Project internals
 prompt.md
 working.md
+uat.md
 
 # macOS
 .DS_Store
