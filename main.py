@@ -217,6 +217,7 @@ async def _auth_ok(authorization: str) -> bool:
 _registered_clients: dict = {}  # client_id → {client_secret, redirect_uris, ...}
 _auth_codes: dict = {}           # code → {client_id, redirect_uri, code_challenge, scope, exp}
 _idp_sessions: dict = {}         # opaque_refresh_token → {idp_refresh_token, client_id, scope, exp}
+_mcp_sessions: dict = {}         # Mcp-Session-Id → {created, bearer}
 
 
 def _validate_token(authorization: str) -> bool:
@@ -2108,19 +2109,28 @@ async def mcp_endpoint(payload: dict, request: Request):
     req_id = payload.get("id", 1)
 
     if method == "initialize":
-        return JSONResponse(content={
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": payload.get("params", {}).get("protocolVersion", "2024-11-05"),
-                "capabilities": {
-                    "tools": {"listChanged": False},
-                    "prompts": {"listChanged": False},
-                    "resources": {"listChanged": False},
+        session_id = str(uuid.uuid4())
+        _mcp_sessions[session_id] = {"created": int(time.time()), "bearer": authorization[7:] if authorization.startswith("Bearer ") else ""}
+        return JSONResponse(
+            headers={"Mcp-Session-Id": session_id},
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": payload.get("params", {}).get("protocolVersion", "2024-11-05"),
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "prompts": {"listChanged": False},
+                        "resources": {"listChanged": False},
+                    },
+                    "serverInfo": {"name": "cyberark-pvwa", "version": "2.0.0"},
                 },
-                "serverInfo": {"name": "cyberark-pvwa", "version": "2.0.0"},
             },
-        })
+        )
+
+    session_id = request.headers.get("Mcp-Session-Id") or request.headers.get("mcp-session-id")
+    if session_id and session_id not in _mcp_sessions:
+        return JSONResponse(status_code=404, content={"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": "Session not found"}})
 
     if method in ("tools/list", "list_tools"):
         return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
