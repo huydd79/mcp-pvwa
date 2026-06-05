@@ -268,7 +268,7 @@ class PVWAClient:
     def __init__(self) -> None:
         self._token: Optional[str] = None
         self._saml_session: bool = False  # True when logged in via SAML
-        self._client = httpx.AsyncClient(verify=VERIFY_SSL)
+        self._client = httpx.AsyncClient(verify=VERIFY_SSL, timeout=30)
 
     # ------------------------------------------------------------------
     # SAML helpers
@@ -467,17 +467,25 @@ class PVWAClient:
         Priority: SAML (OAuth Bearer) → env-var credentials → tool-provided credentials.
         Raises PermissionError with guidance when no credentials are available.
         """
-        # Strategy 1: SAML via IdP token exchange
+        # Strategy 1: SAML via IdP token exchange (2 attempts — PVWA can be slow on first call)
         if PVWA_SAML_ENABLED and USE_EXTERNAL_IDP:
             bearer = _bearer_ctx.get()
             if bearer:
-                saml = await self._get_saml_assertion(bearer)
-                if saml:
-                    try:
-                        await self._logon_saml(saml)
-                        return
-                    except Exception as e:
-                        logger.warning("SAML logon failed (%s) — falling back to direct auth.", e)
+                for _attempt in range(2):
+                    saml = await self._get_saml_assertion(bearer)
+                    if saml:
+                        try:
+                            await self._logon_saml(saml)
+                            return
+                        except Exception as e:
+                            if _attempt == 0:
+                                logger.warning("SAML logon attempt 1 failed (%s) — retrying in 3s.", e)
+                                await asyncio.sleep(3)
+                            else:
+                                logger.warning("SAML logon failed after 2 attempts (%s) — falling back to direct auth.", e)
+                    elif _attempt == 0:
+                        logger.warning("SAML assertion not obtained on attempt 1 — retrying in 3s.")
+                        await asyncio.sleep(3)
 
         # Strategy 2 + 3: Direct credentials (env vars, then tool-provided args)
         _username = username or USERNAME
