@@ -551,13 +551,15 @@ TOOLS = [
     {
         "name": "cyberark_logon",
         "description": (
-            "Authenticate to CyberArk PVWA and obtain a session token. "
-            "Authentication priority: "
-            "(1) SAML via the active OAuth/IdP session when PVWA_SAML_ENABLED=true; "
+            "OPTIONAL — Do NOT call this before other tools. "
+            "All CyberArk tools authenticate automatically (via SAML or env-var credentials) "
+            "before executing; you do not need to log in first. "
+            "Only call this tool explicitly when the user specifically asks to log in, "
+            "or to authenticate as a different user with custom credentials. "
+            "Authentication priority used by all tools: "
+            "(1) SAML via IdP when PVWA_SAML_ENABLED=true; "
             "(2) CYBERARK_USERNAME/PASSWORD environment variables; "
-            "(3) username/password/auth_type supplied to this tool. "
-            "Call with explicit credentials when env vars are not configured "
-            "or when you need to authenticate as a different user."
+            "(3) username/password/auth_type supplied here."
         ),
         "inputSchema": {
             "type": "object",
@@ -582,7 +584,7 @@ TOOLS = [
     },
     {
         "name": "cyberark_logoff",
-        "description": "Terminate the current CyberArk PVWA session and invalidate the token.",
+        "description": "OPTIONAL — Do NOT call this after other tools. The server manages session lifecycle automatically. Only call explicitly when the user specifically asks to log out.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     # ── System Health ───────────────────────────────────────────────────────
